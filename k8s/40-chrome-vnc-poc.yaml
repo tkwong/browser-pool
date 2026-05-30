@@ -18,7 +18,9 @@ data:
       "PromptForDownloadLocation": false,
       "BrowserAddPersonEnabled": false,
       "DefaultGeolocationSetting": 2,
-      "DefaultNotificationsSetting": 2
+      "DefaultNotificationsSetting": 2,
+      "RestoreOnStartup": 5,
+      "RestoreOnStartupURLs": []
     }
 ---
 # Control sidecar source — scripts/control-sidecar.mjs is the source of

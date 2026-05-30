@@ -60,7 +60,7 @@ logs:
 	$(KUBECTL) -n $(NS) logs -f deploy/allocator --tail=200
 
 smoke:
-	python tests/smoke.py
+	python3 tests/smoke.py
 
 clean:
 	$(KUBECTL) delete namespace $(NS) --wait=false

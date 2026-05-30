@@ -1,0 +1,10 @@
+# Dedicated namespace for browser-pool.
+# IMPORTANT: no `zeabur_*` labels — Zeabur agent only manages namespaces
+# labeled with its own metadata, so this stays out of Zeabur's reach.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: browser-pool
+  labels:
+    app.kubernetes.io/managed-by: kubectl
+    app.kubernetes.io/part-of: browser-pool

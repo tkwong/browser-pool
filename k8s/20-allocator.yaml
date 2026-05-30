@@ -1,0 +1,124 @@
+# Allocator: lease broker (FastAPI).
+#
+# No image build needed for v1 — the python:3.12-slim base installs deps on
+# start and runs `main.py` from a ConfigMap. Cold start ~30 s (one-time per
+# pod restart). Switch to a baked image later if startup latency matters.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allocator-code
+  namespace: browser-pool
+data:
+  # Single-file allocator. Keep in sync with allocator/main.py in this repo.
+  # `make sync-allocator` (see Makefile) regenerates this ConfigMap.
+  main.py: |
+    {{ ALLOCATOR_MAIN_PY }}    # placeholder — replaced by `make sync-allocator`
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: allocator
+  namespace: browser-pool
+spec:
+  selector: { app: allocator }
+  ports:
+    - { name: http, port: 80, targetPort: 8000 }
+---
+# Optional: ALLOCATOR_SERVICE_TOKEN. Create with:
+#   kubectl -n browser-pool create secret generic allocator-secrets \
+#     --from-literal=ALLOCATOR_SERVICE_TOKEN=$(openssl rand -hex 32)
+# Leave absent to disable auth (relying on CF Access for the public hostname).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: allocator
+  namespace: browser-pool
+spec:
+  replicas: 1                        # in-memory state; do NOT scale beyond 1 in v1
+  strategy: { type: Recreate }        # ensure only 1 instance during rollout
+  selector: { matchLabels: { app: allocator } }
+  template:
+    metadata: { labels: { app: allocator } }
+    spec:
+      containers:
+        - name: allocator
+          image: python:3.12-slim
+          workingDir: /app
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              # cloudflared (for per-lease Quick Tunnel magic-links)
+              if ! command -v cloudflared >/dev/null 2>&1; then
+                apt-get update -qq && apt-get install -y -qq --no-install-recommends curl >/dev/null
+                curl -fsSL -o /usr/local/bin/cloudflared \
+                  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+                chmod +x /usr/local/bin/cloudflared
+                cloudflared --version
+              fi
+              pip install --no-cache-dir --quiet \
+                fastapi==0.115.0 uvicorn==0.30.6 httpx==0.27.2 'pydantic>=2.9,<3'
+              exec uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
+          env:
+            # v2: chrome-vnc × 2 replicas (scale 3→2 for ML110 RAM budget,
+            # bump back when 32GB upgrade lands). Per-pod NodePort for CDP.
+            - { name: POOL_PODS,                value: "chrome-vnc-0,chrome-vnc-1" }
+            - { name: DEFAULT_TIER,             value: "chrome-vnc" }
+            - { name: POD_URL_TEMPLATE,         value: "https://{pod}.cartforge.net" }
+            - { name: POD_INTERNAL_URL_TEMPLATE, value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9223" }
+            - { name: POD_UPSTREAM_HOST_TEMPLATE, value: "{pod}.chrome-vnc.browser-pool.svc.cluster.local" }  # for quick-tunnel cloudflared
+            # Per-pod CDP NodePort overrides (uppercased pod name with dashes->underscores).
+            - { name: CDP_URL_CHROME_VNC_0,     value: "http://100.108.4.108:30922" }
+            - { name: CDP_URL_CHROME_VNC_1,     value: "http://100.108.4.108:30923" }
+            # Per-pod control-sidecar URL template — allocator POSTs /wipe on release.
+            - { name: CONTROL_URL_TEMPLATE,     value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9224" }
+            - { name: QUICK_TUNNEL_TARGET_PORT, value: "3000" }                          # noVNC
+            - { name: DEFAULT_TTL_SECONDS,      value: "3600" }
+            - { name: MAX_TTL_SECONDS,          value: "14400" }
+            - { name: REAPER_INTERVAL_SECONDS,  value: "10" }
+            - { name: PROFILES_DIR,             value: "/profiles" }
+          envFrom:
+            - secretRef: { name: allocator-secrets, optional: true }
+          ports:
+            - { name: http, containerPort: 8000 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 30            # account for pip install + cloudflared download on first boot
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources:
+            requests: { memory: "96Mi", cpu: "50m" }
+            limits:   { memory: "256Mi", cpu: "500m" }
+          volumeMounts:
+            - { name: code,     mountPath: /app }
+            - { name: profiles, mountPath: /profiles }
+      volumes:
+        - name: code
+          configMap:
+            name: allocator-code
+            items:
+              - { key: main.py, path: main.py }
+        - name: profiles
+          persistentVolumeClaim:
+            claimName: allocator-profiles
+---
+# Named-profile store. Small PVC, allocator-local. Survives deployment
+# rollouts. Migrate to NocoDB / object storage when cross-allocator sharing
+# becomes a need.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: allocator-profiles
+  namespace: browser-pool
+spec:
+  accessModes: [ ReadWriteOnce ]
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: local-path

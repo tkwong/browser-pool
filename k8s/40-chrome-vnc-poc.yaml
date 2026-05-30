@@ -1,0 +1,261 @@
+# Chromium Enterprise Policy: disable password manager, autofill, payment
+# methods. With this in place, the "Save password?" prompt never appears —
+# Chromium has no PWM to save into.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chrome-vnc-policy
+  namespace: browser-pool
+data:
+  policies.json: |
+    {
+      "PasswordManagerEnabled": false,
+      "AutofillAddressEnabled": false,
+      "AutofillCreditCardEnabled": false,
+      "PaymentMethodPrivacySandboxEnabled": false,
+      "BrowserSignin": 0,
+      "SyncDisabled": true,
+      "PromptForDownloadLocation": false,
+      "BrowserAddPersonEnabled": false,
+      "DefaultGeolocationSetting": 2,
+      "DefaultNotificationsSetting": 2
+    }
+---
+# Control sidecar source — scripts/control-sidecar.mjs is the source of
+# truth; Makefile awk template inlines it at apply time at the marker below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chrome-vnc-control-code
+  namespace: browser-pool
+data:
+  control.mjs: |
+    {{ CONTROL_SIDECAR_MJS }}
+---
+# ConfigMap with nginx config for the cdp-relay sidecar. nginx is HTTP-aware,
+# so it can rewrite the Host header to "localhost" (required by Chrome 148's
+# anti-DNS-rebinding check on /json/*). socat couldn't do this because it's
+# L4-only and passed the incoming Host through verbatim.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chrome-vnc-cdp-relay-conf
+  namespace: browser-pool
+data:
+  nginx.conf: |
+    events {}
+    http {
+      server {
+        listen 9223;
+        # Long timeouts for CDP WebSocket (DevTools page sessions can be long-lived).
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        location / {
+          proxy_pass http://127.0.0.1:9222;
+          proxy_set_header Host localhost;           # Chrome anti-DNS-rebinding
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;    # WebSocket upgrade for /devtools/page/<id>
+          proxy_set_header Connection "upgrade";
+          # Chrome returns webSocketDebuggerUrl=ws://localhost/... because we
+          # rewrote its Host. Rewrite the response body back to the real host
+          # so Playwright's connectOverCDP can follow the URL.
+          proxy_set_header Accept-Encoding "";       # disable gzip so sub_filter runs
+          sub_filter_types application/json;
+          sub_filter_once off;
+          sub_filter 'ws://localhost/'   'ws://$http_host/';
+          sub_filter 'http://localhost/' 'http://$http_host/';
+        }
+      }
+    }
+---
+# Chrome-VNC PoC: a real headed Chromium in Xvfb with noVNC viewer and CDP
+# port. Replaces Steel for the "real browser + user takeover + agent drive"
+# requirement. PoC = 1 replica, no allocator integration yet.
+#
+# - noVNC web UI on container port 3000  -> exposed via Quick Tunnel (magic-link)
+# - CDP                on container port 9222 -> exposed on host NodePort (Tailscale-reachable)
+#                                               so playwright-mcp can do --cdp-endpoint=ws://100.108.4.108:30922
+#
+# We base on lscr.io/linuxserver/chromium because it ships the whole
+# Xvfb+Openbox+noVNC+Chromium stack out of the box. If we need Google Chrome
+# (Widevine, branded fingerprint) we swap the image later.
+
+# Headless governing service: required by StatefulSet for stable per-pod DNS
+# (chrome-vnc-0.chrome-vnc.svc, chrome-vnc-1.chrome-vnc.svc, ...). clusterIP:
+# None makes A records resolve to individual pod IPs, which Quick Tunnel
+# cloudflared uses to point at a specific replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chrome-vnc
+  namespace: browser-pool
+  labels: { app: chrome-vnc }
+spec:
+  clusterIP: None
+  selector: { app: chrome-vnc }
+  ports:
+    - { name: novnc,   port: 3000, targetPort: 3000 }
+    - { name: cdp,     port: 9223, targetPort: 9223 }
+    - { name: control, port: 9224, targetPort: 9224 }   # allocator-only; intentionally NOT exposed as NodePort
+---
+# Per-pod NodePort for CDP, pinned via the StatefulSet pod-name label. Each
+# replica gets a distinct nodePort so the allocator can route a lease to a
+# specific pod's CDP endpoint over Tailscale (no L4 round-robin surprise).
+# Add more entries here when scaling beyond 3 replicas.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chrome-vnc-cdp-0
+  namespace: browser-pool
+  labels: { app: chrome-vnc, role: cdp-nodeport, pod: chrome-vnc-0 }
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: chrome-vnc-0
+  ports:
+    - { name: cdp, port: 9223, targetPort: 9223, nodePort: 30922 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chrome-vnc-cdp-1
+  namespace: browser-pool
+  labels: { app: chrome-vnc, role: cdp-nodeport, pod: chrome-vnc-1 }
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: chrome-vnc-1
+  ports:
+    - { name: cdp, port: 9223, targetPort: 9223, nodePort: 30923 }
+---
+# chrome-vnc-cdp-2 dropped 2026-05-30 (scale 3 → 2 for ML110 RAM budget).
+# Restore + bump replicas back to 3 when ML110 32GB upgrade is in.
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chrome-vnc
+  namespace: browser-pool
+spec:
+  serviceName: chrome-vnc
+  replicas: 2
+  # podManagementPolicy: Parallel would be nicer but the field is immutable on
+  # an existing StatefulSet. Sticking with OrderedReady (default).
+  selector: { matchLabels: { app: chrome-vnc } }
+  template:
+    metadata: { labels: { app: chrome-vnc } }
+    spec:
+      # We previously tried shareProcessNamespace: true here so the control
+      # sidecar could pidof+kill chromium. It failed: linuxserver/chromium's
+      # s6-overlay refuses to run unless it is PID 1 ("s6-overlay-suexec:
+      # fatal: can only run as pid 1"). Switched to CDP-based wipe instead —
+      # sidecar talks to chromium over localhost:9223 (cdp-relay nginx →
+      # chromium 9222) and uses Network.clearBrowserCookies +
+      # Storage.clearDataForOrigin, no process kill needed.
+      containers:
+        - name: chromium
+          image: lscr.io/linuxserver/chromium:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PUID, value: "1000" }
+            - { name: PGID, value: "1000" }
+            - { name: TZ,   value: "Asia/Hong_Kong" }
+            # CHROME_CLI: extra args appended to the Chromium launch command
+            # by the linuxserver init scripts.
+            - name: CHROME_CLI
+              # --remote-allow-origins=* bypasses the post-2023 Chromium CDP
+              # Host-header anti-DNS-rebinding check; needed because requests
+              # going through socat will have non-localhost Host headers.
+              value: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run --no-default-browser-check"
+          ports:
+            - { name: novnc, containerPort: 3000 }
+          resources:
+            requests: { memory: "512Mi", cpu: "300m" }
+            limits:   { memory: "2Gi",   cpu: "2000m" }
+          # /dev/shm must be larger than the default 64MiB or Chromium tab
+          # rendering crashes randomly.
+          volumeMounts:
+            - { name: dshm,   mountPath: /dev/shm }
+            - { name: config, mountPath: /config }
+            # Chromium Enterprise Policy: disable PWM + autofill (prevents
+            # "Save password?" prompt entirely). WebAuthn kept enabled — user
+            # can still use phone-via-QR passkey when site offers it (platform
+            # passkey naturally fails because container has no TouchID/USB).
+            - { name: chrome-policy, mountPath: /etc/chromium/policies/managed, readOnly: true }
+          readinessProbe:
+            tcpSocket: { port: 3000 }
+            initialDelaySeconds: 8
+            periodSeconds: 5
+          # Chromium's CDP server can wedge after long uptime even though the
+          # process is running — observed empirically after ~42h. Probe via the
+          # socat relay (pod-IP:9223 is reachable, 127.0.0.1:9222 is not).
+          # 3 consecutive failures → restart container → fresh chromium.
+          livenessProbe:
+            httpGet:
+              path: /json/version
+              port: 9223
+            initialDelaySeconds: 90
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+        # Sidecar: nginx L7 proxy 0.0.0.0:9223 -> 127.0.0.1:9222 (Chromium CDP),
+        # rewriting Host header to "localhost" (required by Chrome 148's
+        # anti-DNS-rebinding check on /json/* — socat L4 relay couldn't do this).
+        - name: cdp-relay
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: cdp, containerPort: 9223 }
+          resources:
+            requests: { memory: "16Mi", cpu: "10m" }
+            limits:   { memory: "64Mi", cpu: "200m" }
+          volumeMounts:
+            - { name: cdp-relay-conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf }
+        # Sidecar: control plane. Allocator POSTs /wipe on lease release →
+        # kills chromium (s6 respawns) and rm -rf /config/.config/chromium so
+        # the next lease starts on a fresh profile. Future endpoints: dump /
+        # inject named profile, restart chromium with flags, status probe.
+        - name: control
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/app/control.mjs"]
+          ports:
+            - { name: control, containerPort: 9224 }
+          env:
+            - { name: CONTROL_PORT, value: "9224" }
+            - { name: CDP_BASE,     value: "http://localhost:9223" }    # via cdp-relay nginx → chromium 9222
+          resources:
+            requests: { memory: "32Mi", cpu: "10m" }
+            limits:   { memory: "128Mi", cpu: "500m" }
+          volumeMounts:
+            - { name: control-code, mountPath: /app, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9224 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+      volumes:
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }
+        - name: cdp-relay-conf
+          configMap: { name: chrome-vnc-cdp-relay-conf }
+        - name: chrome-policy
+          configMap:
+            name: chrome-vnc-policy
+            items:
+              - { key: policies.json, path: policies.json }
+        - name: control-code
+          configMap:
+            name: chrome-vnc-control-code
+            items:
+              - { key: control.mjs, path: control.mjs }
+        # config is now a per-pod PVC via volumeClaimTemplates below — login
+        # state (cookies, localStorage, IndexedDB) survives pod restarts.
+  volumeClaimTemplates:
+    - metadata:
+        name: config
+      spec:
+        accessModes: [ ReadWriteOnce ]
+        resources:
+          requests:
+            storage: 5Gi
+        storageClassName: local-path     # k3s default

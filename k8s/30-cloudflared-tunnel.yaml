@@ -1,0 +1,55 @@
+# In-cluster Cloudflare Tunnel — separate tunnel from the host-level one
+# (which serves Zeabur). This one lives in browser-pool and can resolve
+# cluster DNS (e.g. `steel-0.steel.browser-pool.svc.cluster.local`).
+#
+# PREREQUISITES (manual, in CF Zero Trust dashboard):
+#   1. Networks -> Tunnels -> Create tunnel -> "browser-pool"
+#   2. Copy the connector token shown.
+#   3. Create the secret BEFORE applying this file:
+#        kubectl -n browser-pool create secret generic cloudflared-tunnel \
+#          --from-literal=token='PASTE_TOKEN_HERE'
+#   4. In CF dashboard -> tunnel -> Public Hostnames, add:
+#        allocator.cartforge.net  -> http://allocator.browser-pool.svc.cluster.local
+#      (chrome-vnc per-pod hostnames are intentionally NOT exposed via this
+#      named tunnel — per-lease access goes through Quick Tunnels spawned by
+#      the allocator, gating by unguessable subdomain + short lifetime.)
+#      Legacy steel-{0..2}.cartforge.net hostnames in the CF dashboard are
+#      deprecated (Steel retired 2026-05-30); can be deleted manually.
+#   5. Access -> Applications -> Add Self-hosted for each hostname.
+#      - allocator : service token (for agents) + huskydata.io email (you)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: browser-pool
+spec:
+  replicas: 2                     # HA: 2 connectors so a rolling update has no downtime
+  selector: { matchLabels: { app: cloudflared } }
+  template:
+    metadata: { labels: { app: cloudflared } }
+    spec:
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:latest
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-tunnel
+                  key: token
+          ports:
+            - { name: metrics, containerPort: 2000 }
+          livenessProbe:
+            httpGet: { path: /ready, port: 2000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { memory: "64Mi", cpu: "50m" }
+            limits:   { memory: "256Mi", cpu: "500m" }

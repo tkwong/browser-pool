@@ -1,0 +1,15 @@
+{
+  "name": "browser-pool-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the browser-pool: lazy-acquire a remote Chromium pod, drive via Playwright CDP, offload to user via noVNC magic-link.",
+  "type": "module",
+  "bin": {
+    "browser-pool-mcp": "./index.mjs"
+  },
+  "main": "index.mjs",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "playwright-core": "^1.55.0"
+  }
+}

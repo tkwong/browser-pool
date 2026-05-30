@@ -156,7 +156,11 @@ spec:
       # Storage.clearDataForOrigin, no process kill needed.
       containers:
         - name: chromium
-          image: lscr.io/linuxserver/chromium:latest
+          # Pinned by digest (2026-05-30) so a linuxserver bump can't silently
+          # break our Storage.* CDP contract. To upgrade: bump tag locally,
+          # `kubectl get pod chrome-vnc-0 -o jsonpath='{...imageID}'` to read
+          # the new digest, paste here, smoke test, commit.
+          image: lscr.io/linuxserver/chromium:latest@sha256:47fc8bb18cdb0844199a16e1e14b3b38ba97f6ad1659895c243ba5f2384aad1e
           imagePullPolicy: IfNotPresent
           env:
             - { name: PUID, value: "1000" }
@@ -204,7 +208,7 @@ spec:
         # rewriting Host header to "localhost" (required by Chrome 148's
         # anti-DNS-rebinding check on /json/* — socat L4 relay couldn't do this).
         - name: cdp-relay
-          image: nginx:1.27-alpine
+          image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
           imagePullPolicy: IfNotPresent
           ports:
             - { name: cdp, containerPort: 9223 }
@@ -218,7 +222,7 @@ spec:
         # the next lease starts on a fresh profile. Future endpoints: dump /
         # inject named profile, restart chromium with flags, status probe.
         - name: control
-          image: node:22-alpine
+          image: node:22-alpine@sha256:968df39aedcea65eeb078fb336ed7191baf48f972b4479711397108be0966920
           imagePullPolicy: IfNotPresent
           command: ["node", "/app/control.mjs"]
           ports:

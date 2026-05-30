@@ -153,26 +153,31 @@ if matching:
 
 
 # --------------------------------------------------------------------------- #
-# 5. Pool exhaustion                                                           #
+# 5. Per-token rate limit (429 token_quota_exceeded)                           #
+# When MAX_LEASES_PER_TOKEN=1 (prod default), a single token can hold 1 lease  #
+# at a time. The 2nd concurrent acquire from same token = 429 BEFORE pool      #
+# exhaustion. Pool exhaustion (423) requires multi-token traffic — not covered #
+# by single-token smoke.                                                       #
 # --------------------------------------------------------------------------- #
-step(f"pool exhaustion (size {POOL_SIZE})")
-held = []
-for i in range(POOL_SIZE):
-    r = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
-    check(f"acquire #{i+1} == 200", r.status_code == 200, str(r.status_code))
-    if r.status_code == 200:
-        held.append(r.json()["lease_id"])
+step("per-token rate limit (429 token_quota_exceeded)")
+r1 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
+check("first acquire 200", r1.status_code == 200, str(r1.status_code))
+r2 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
+check("second acquire 429", r2.status_code == 429, str(r2.status_code))
+check("Retry-After header present on 429",
+      "retry-after" in {k.lower() for k in r2.headers})
+if r2.status_code == 429:
+    err = r2.json()
+    check("error=token_quota_exceeded", err.get("error") == "token_quota_exceeded")
+    check("max_leases_per_token reported", isinstance(err.get("max_leases_per_token"), int))
 
-r = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
-check(f"acquire #{POOL_SIZE+1} == 423", r.status_code == 423, str(r.status_code))
-check("Retry-After header present",
-      "retry-after" in {k.lower() for k in r.headers})
-if r.status_code == 423:
-    err = r.json()
-    check("error=pool_exhausted", err.get("error") == "pool_exhausted")
-
-for lid in held:
-    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": lid})
+# Release the first → 2nd attempt should now succeed
+if r1.status_code == 200:
+    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": r1.json()["lease_id"]})
+r3 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
+check("after release, fresh acquire 200", r3.status_code == 200, str(r3.status_code))
+if r3.status_code == 200:
+    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": r3.json()["lease_id"]})
 
 
 # --------------------------------------------------------------------------- #

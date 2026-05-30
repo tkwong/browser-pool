@@ -79,6 +79,7 @@ spec:
             - { name: MAX_TTL_SECONDS,          value: "14400" }
             - { name: REAPER_INTERVAL_SECONDS,  value: "10" }
             - { name: PROFILES_DIR,             value: "/profiles" }
+            - { name: MAX_LEASES_PER_TOKEN,     value: "1" }   # per-CF-Access-Client-Id concurrent cap; 429 over
           envFrom:
             - secretRef: { name: allocator-secrets, optional: true }
           ports:

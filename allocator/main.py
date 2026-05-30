@@ -69,6 +69,13 @@ CONTROL_PROFILE_TIMEOUT = int(os.environ.get("CONTROL_PROFILE_TIMEOUT_SECONDS", 
 # allocator pod restarts. Empty/None disables the feature.
 PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", "/profiles"))
 _PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
+
+# Per-token rate limit. Quota key is the CF-Access-Client-Id header (preserved
+# by CF Access untouched; falls back to "anonymous" if absent for dev).
+# MAX_LEASES_PER_TOKEN caps concurrent active leases for one token —
+# prevents a single agent looping acquire+release from starving others.
+# Default 0 = disabled (dev). Production sets via k8s env, currently 1.
+MAX_LEASES_PER_TOKEN = int(os.environ.get("MAX_LEASES_PER_TOKEN", "0"))
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_SECONDS", "600"))   # 10 min
 MAX_TTL = int(os.environ.get("MAX_TTL_SECONDS", "3600"))          # 1 hour
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL_SECONDS", "10"))
@@ -307,16 +314,37 @@ class ReleaseReq(BaseModel):
 # Routes                                                                      #
 # --------------------------------------------------------------------------- #
 @app.post("/acquire", response_model=AcquireResp)
-def acquire(req: AcquireReq, authorization: Optional[str] = Header(default=None)):
+def acquire(
+    req: AcquireReq,
+    authorization: Optional[str] = Header(default=None),
+    cf_access_client_id: Optional[str] = Header(default=None, alias="CF-Access-Client-Id"),
+):
     _check_auth(authorization)
     ttl = req.ttl or DEFAULT_TTL
-    # Atomically claim a pod slot, then (outside the lock) spawn the per-lease
-    # quick tunnel — cloudflared startup takes ~5-10s and we don't want to
-    # block other acquire calls during that window.
+    quota_key = cf_access_client_id or "anonymous"
+    # Atomically check per-token quota + claim a pod slot. quota check is
+    # inside the lock so a burst of concurrent acquires from one token can't
+    # all slip through.
     claimed_pod: Optional[str] = None
     lease_id = str(uuid.uuid4())
     exp = _now() + timedelta(seconds=ttl)
     with _lock:
+        if MAX_LEASES_PER_TOKEN > 0:
+            active_for_token = sum(
+                1 for st in _state.values()
+                if st is not None and st.get("quota_key") == quota_key
+            )
+            if active_for_token >= MAX_LEASES_PER_TOKEN:
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": "30"},
+                    content={
+                        "error": "token_quota_exceeded",
+                        "retry_after": 30,
+                        "active_leases": active_for_token,
+                        "max_leases_per_token": MAX_LEASES_PER_TOKEN,
+                    },
+                )
         for pod in POOL:
             if _state[pod] is None:
                 claimed_pod = pod
@@ -326,6 +354,7 @@ def acquire(req: AcquireReq, authorization: Optional[str] = Header(default=None)
                     "leased_at": _now(),
                     "qt_proc": None,
                     "view_url": None,
+                    "quota_key": quota_key,
                 }
                 _lease_to_pod[lease_id] = pod
                 break

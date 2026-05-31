@@ -6,7 +6,7 @@ NS      ?= browser-pool
 # Change to your own node (or override at call time: `make remote-apply ML110=root@your-node`)
 ML110   ?= root@100.108.4.108
 
-.PHONY: help bundle apply restart status logs smoke clean
+.PHONY: help bundle apply restart status logs smoke integration clean
 
 help:
 	@echo "Targets:"
@@ -15,7 +15,8 @@ help:
 	@echo "  make restart          # restart allocator + chrome-vnc (pick up new code/image)"
 	@echo "  make status           # kubectl get all -n $(NS)"
 	@echo "  make logs             # tail allocator logs"
-	@echo "  make smoke            # run tests/smoke.py against the live allocator"
+	@echo "  make smoke            # run tests/smoke.py (pure httpx, fast — REST surface)"
+	@echo "  make integration      # run clients/mcp/test-integration.mjs (Playwright, slow — real nav + content)"
 	@echo "  make clean            # delete the namespace"
 
 # Render the allocator ConfigMap with main.py inlined into a tmp directory.
@@ -62,6 +63,12 @@ logs:
 
 smoke:
 	python3 tests/smoke.py
+
+# Full Playwright integration: actually connects CDP, navigates pages, asserts
+# content rendered. Catches what smoke can't (anti-bot blocks, WS upgrade fail,
+# profile inject not reaching context). Slower (~30-45s) — opt-in.
+integration:
+	cd clients/mcp && node test-integration.mjs
 
 clean:
 	$(KUBECTL) delete namespace $(NS) --wait=false

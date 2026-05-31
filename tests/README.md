@@ -49,9 +49,36 @@ BROWSER_POOL_URL=... CF_ACCESS_CLIENT_ID=... CF_ACCESS_CLIENT_SECRET=... make sm
 | `acquire #N == 423 (200)` | pool 比預期大。check `kubectl -n browser-pool get sts/chrome-vnc -o jsonpath="{.spec.replicas}"` 同 allocator env `POOL_PODS` 對齊冇 |
 | `Missing CF_ACCESS_…` | service token file 唔見;`ls ~/.config/browser-pool/` 確認;或者 env override |
 
-## 唔 cover 嘅(下一輪 add)
+## Layer 2:integration(Playwright)
+
+```bash
+make integration
+# 等於 cd clients/mcp && node test-integration.mjs
+```
+
+`clients/mcp/test-integration.mjs` 用 Playwright 真正打開 browser + navigate,exercise smoke.py 唔 cover 嘅 path:CDP WebSocket upgrade through CF Tunnel、真實 page render、profile inject 入 context cookies。
+
+| Step | Check |
+|---|---|
+| acquire + connect | `acquire 200`、`cdp_url` 係 CF Tunnel URL、`view_url` 係 trycloudflare、`connectOverCDP` 真接到 |
+| navigate example.com | HTTP 200、title contains 'Example'、body innerText > 100 chars |
+| navigate aastocks.com | HTTP 200、title 係 AAStocks 中文、body innerText > **1000 chars**(catches anti-bot challenge pages、agent 報 0 chars 嗰類 bug)|
+| profile inject | acquire {profile} → `profile_injected.cookies > 0`、`context.cookies().length >= injected count` |
+
+13 checks total。較 smoke 慢(~30-45s,因為兩次 navigate + Playwright connect),所以 opt-in 唔自動跑。
+
+## 兩層 test pyramid 分工
+
+```
+smoke(httpx,~10s)      ← daily quick check,deploy verify
+integration(Playwright,~40s)  ← agent report 「somehow 0 chars / blank」嗰陣跑
+```
+
+`make smoke` 全綠但 agent 仍有 issue → 跑 `make integration`,大機會抓到 client-path bug。
+
+## 仲未 cover
 
 - MCP integration(spawn `node clients/mcp/index.mjs`,stdio dispatch 22 tools)
-- 真實 browser navigate(會打網,要 Playwright)
 - 並發 lease lifetime / reaper expiry timing
 - Allocator unit tests(pure logic — profile name regex、auth header parsing)
+- Human offload flow(help_mode → wait_for_user_done,要 human)

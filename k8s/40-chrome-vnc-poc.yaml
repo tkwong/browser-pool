@@ -47,6 +47,18 @@ data:
   nginx.conf: |
     events {}
     http {
+      # Pick ws vs wss based on X-Forwarded-Proto. CF Tunnel sets it to "https"
+      # (TLS terminated at CF edge); direct Tailscale NodePort traffic doesn't,
+      # so default ws://. Without this map, a CF Tunnel client receives a
+      # ws:// URL it can't reach (CF edge is HTTPS-only).
+      map $http_x_forwarded_proto $cdp_ws_scheme {
+        default ws;
+        https   wss;
+      }
+      map $http_x_forwarded_proto $cdp_http_scheme {
+        default http;
+        https   https;
+      }
       server {
         listen 9223;
         # Long timeouts for CDP WebSocket (DevTools page sessions can be long-lived).
@@ -64,8 +76,8 @@ data:
           proxy_set_header Accept-Encoding "";       # disable gzip so sub_filter runs
           sub_filter_types application/json;
           sub_filter_once off;
-          sub_filter 'ws://localhost/'   'ws://$http_host/';
-          sub_filter 'http://localhost/' 'http://$http_host/';
+          sub_filter 'ws://localhost/'   '$cdp_ws_scheme://$http_host/';
+          sub_filter 'http://localhost/' '$cdp_http_scheme://$http_host/';
         }
       }
     }

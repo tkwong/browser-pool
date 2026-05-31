@@ -172,7 +172,10 @@ async function ensureBrowser() {
   lease = await allocatorAcquire(useProfile);
   log(`acquired pod=${lease.pod} cdp=${lease.cdp_url} view=${lease.view_url}` +
       (lease.profile_injected ? ` profile=${useProfile} (${lease.profile_injected.cookies}c/${lease.profile_injected.origins}o)` : ""));
-  browser = await chromium.connectOverCDP(lease.cdp_url);
+  // Pass CF Access headers — when cdp_url is a CF Tunnel hostname, the WS
+  // upgrade needs the same auth as the REST allocator. (No effect when the
+  // operator's NodePort URL is used inside the tailnet.)
+  browser = await chromium.connectOverCDP(lease.cdp_url, { headers: CF_HEADERS });
   context = browser.contexts()[0] || (await browser.newContext());
   page = context.pages()[0] || (await context.newPage());
 }

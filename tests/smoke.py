@@ -137,6 +137,26 @@ check("got view_url", bool(acq.get("view_url")))
 inj = acq.get("profile_injected") or {}
 check("profile_injected.cookies == 1", inj.get("cookies") == 1, str(inj))
 
+# v2.5 CDP reach check — proves cdp_url is reachable from THIS client (catches
+# the "operator-only Tailscale URL" mistake that bit asset-mgmt agent 2026-05-31).
+# A separate Playwright connect would prove WS, but /json/version proves the
+# HTTP route (incl. CF Access if applicable). WS upgrade is exercised by the
+# MCP client at lease use time; doing it here would require a Playwright dep.
+cdp_r = CLIENT.get(f"{acq['cdp_url']}/json/version")
+check("cdp_url /json/version 200", cdp_r.status_code == 200,
+      f"got HTTP {cdp_r.status_code} — agent's network probably can't reach cdp_url")
+if cdp_r.status_code == 200:
+    ver = cdp_r.json()
+    check("/json/version returns Chrome version", "Chrome/" in (ver.get("Browser") or ""))
+    ws_url = ver.get("webSocketDebuggerUrl") or ""
+    # Behind CF Tunnel (HTTPS), nginx sub_filter must rewrite to wss; behind
+    # plain HTTP NodePort it stays ws. Either is acceptable, but the scheme
+    # must MATCH the cdp_url scheme — else the WS connect from MCP will fail.
+    expect_ws = "wss:" if acq["cdp_url"].startswith("https") else "ws:"
+    check(f"webSocketDebuggerUrl scheme = {expect_ws}",
+          ws_url.startswith(expect_ws),
+          f"got {ws_url[:60]}")
+
 
 # --------------------------------------------------------------------------- #
 # 4. release {save_as, save_domain_filter} → dumped profile matches injected   #

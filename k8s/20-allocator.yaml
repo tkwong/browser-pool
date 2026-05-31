@@ -72,9 +72,13 @@ spec:
             - { name: POD_URL_TEMPLATE,         value: "https://{pod}.cartforge.net" }
             - { name: POD_INTERNAL_URL_TEMPLATE, value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9223" }
             - { name: POD_UPSTREAM_HOST_TEMPLATE, value: "{pod}.chrome-vnc.browser-pool.svc.cluster.local" }  # for quick-tunnel cloudflared
-            # Per-pod CDP NodePort overrides (uppercased pod name with dashes->underscores).
-            - { name: CDP_URL_CHROME_VNC_0,     value: "http://100.108.4.108:30922" }
-            - { name: CDP_URL_CHROME_VNC_1,     value: "http://100.108.4.108:30923" }
+            # Per-pod CDP URL — public CF Tunnel hostname so remote agents
+            # (not on operator's tailnet) can reach. Gated by CF Access wildcard
+            # app cdp-*.cartforge.net using the same service tokens as allocator.
+            # Operator can still hit Tailscale NodePort 30922/30923 directly for
+            # lower latency, but no longer the published path.
+            - { name: CDP_URL_CHROME_VNC_0,     value: "https://cdp-chrome-vnc-0.cartforge.net" }
+            - { name: CDP_URL_CHROME_VNC_1,     value: "https://cdp-chrome-vnc-1.cartforge.net" }
             # Per-pod control-sidecar URL template — allocator POSTs /wipe on release.
             - { name: CONTROL_URL_TEMPLATE,     value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9224" }
             - { name: QUICK_TUNNEL_TARGET_PORT, value: "3000" }                          # noVNC

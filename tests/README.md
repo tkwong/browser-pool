@@ -24,15 +24,16 @@ BROWSER_POOL_URL=https://allocator.example.com make smoke
 BROWSER_POOL_URL=... CF_ACCESS_CLIENT_ID=... CF_ACCESS_CLIENT_SECRET=... make smoke
 ```
 
-成功收尾係 `PASS: 28   FAIL: 0`,exit code 0。
+成功收尾係 `PASS: 31   FAIL: 0`,exit code 0。
 
-## 28 個 check 涵蓋
+## 31 個 check 涵蓋
 
 | Step | 確認 |
 |---|---|
 | healthz | allocator 起咗;pool size ≥ 1 |
 | profile CRUD | PUT / GET / LIST 三 verb 對 1 個 synthetic cookie 嘅 profile work |
 | acquire {profile} | 200 + `cdp_url` + `view_url` + `profile_injected.cookies == 1` |
+| **CDP reach from this client** | `{cdp_url}/json/version` 200 + Chrome version + `webSocketDebuggerUrl` scheme matches cdp_url scheme (`wss:` for `https:`, `ws:` for `http:`). 抓返 2026-05-31 嗰個 "operator-only Tailscale URL" mistake — agent network 唔通就即刻 fail |
 | release {save_as, save_domain_filter} | `saved_to` 寫返;dumped profile 入面個 synthetic cookie name/value/HttpOnly/Secure 全部 preserved |
 | 池 exhaustion | 順序 acquire 到爆滿;next acquire = `423` + `Retry-After` + `error=pool_exhausted` |
 | Default acquire | 冇 profile param 嗰陣 `profile_injected` 係 null |

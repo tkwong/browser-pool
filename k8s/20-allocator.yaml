@@ -66,6 +66,9 @@ spec:
             # bump back when 32GB upgrade lands). Per-pod NodePort for CDP.
             - { name: POOL_PODS,                value: "chrome-vnc-0,chrome-vnc-1" }
             - { name: DEFAULT_TIER,             value: "chrome-vnc" }
+            # Per-pod CF Tunnel hostname template (informational only; the
+            # client uses cdp_url + view_url, not pod_url). Change to your
+            # own domain or leave empty.
             - { name: POD_URL_TEMPLATE,         value: "https://{pod}.cartforge.net" }
             - { name: POD_INTERNAL_URL_TEMPLATE, value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9223" }
             - { name: POD_UPSTREAM_HOST_TEMPLATE, value: "{pod}.chrome-vnc.browser-pool.svc.cluster.local" }  # for quick-tunnel cloudflared

@@ -118,8 +118,9 @@ if (snap.contains_login_form) {
 
 | env | default | meaning |
 |---|---|---|
-| `ALLOCATOR_URL` | `https://allocator.cartforge.net` | allocator base URL |
-| `ALLOCATOR_SERVICE_TOKEN_FILE` | `~/.config/browser-pool/service-token.json` | CF Access service-token JSON |
+| `BROWSER_POOL_URL` *(or `ALLOCATOR_URL`)* | — (required) | allocator base URL, e.g. `https://allocator.example.com` |
+| `BROWSER_TOKEN` | — | `<client_id>:<client_secret>` colon-separated. Alternative to the token file. |
+| `ALLOCATOR_SERVICE_TOKEN_FILE` | `~/.config/browser-pool/service-token.json` | CF Access service-token JSON (used if `BROWSER_TOKEN` not set) |
 | `BROWSER_POOL_TIER` | `chrome-vnc` | which pool tier to request |
 | `BROWSER_POOL_ACQUIRE_TTL` | `3600` | lease TTL in seconds |
 | `BROWSER_POOL_IDLE_RELEASE_MS` | `300000` | auto-release after this many ms of no tool calls (paused during help) |

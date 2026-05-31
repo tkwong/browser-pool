@@ -16,7 +16,11 @@ import { chromium } from 'playwright-core'
 import { writeFileSync, chmodSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-const CDP_URL = process.env.CDP_URL || 'http://100.108.4.108:30922'
+const CDP_URL = process.env.CDP_URL
+if (!CDP_URL) {
+  console.error('Set CDP_URL env (e.g. http://<node-ip>:<nodeport>) — the chrome-vnc pod CDP endpoint')
+  process.exit(2)
+}
 const domainFilter = process.argv[2]
 const outPath = process.argv[3] && resolve(process.argv[3].replace(/^~/, process.env.HOME))
 

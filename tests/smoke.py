@@ -16,8 +16,9 @@ Does NOT need Playwright or k8s — talks only to the allocator HTTP surface
 
 Usage:
     pip install httpx
-    export ALLOCATOR_URL=https://allocator.cartforge.net   # optional, has default
-    # Credentials picked up from env OR ~/.config/browser-pool/service-token.json
+    export BROWSER_POOL_URL=https://allocator.your-domain.com
+    export BROWSER_TOKEN=<client_id>:<client_secret>      # OR token file path below
+    # Or via file: ~/.config/browser-pool/service-token.json
     python tests/smoke.py
 """
 
@@ -29,20 +30,31 @@ from pathlib import Path
 
 import httpx
 
-ALLOCATOR = os.environ.get("ALLOCATOR_URL", "https://allocator.cartforge.net")
+ALLOCATOR = os.environ.get("BROWSER_POOL_URL") or os.environ.get("ALLOCATOR_URL")
+if not ALLOCATOR:
+    sys.exit("Set BROWSER_POOL_URL (e.g. https://allocator.example.com)")
 TOKEN_FILE = Path.home() / ".config" / "browser-pool" / "service-token.json"
 
 
 def _cf_headers() -> dict[str, str]:
+    # 1. BROWSER_TOKEN=<id>:<secret>
+    if os.environ.get("BROWSER_TOKEN"):
+        try:
+            cid, csec = os.environ["BROWSER_TOKEN"].split(":", 1)
+            return {"CF-Access-Client-Id": cid, "CF-Access-Client-Secret": csec}
+        except ValueError:
+            sys.exit("BROWSER_TOKEN must be in '<client_id>:<client_secret>' form")
+    # 2. Split env vars (legacy)
     cid = os.environ.get("CF_ACCESS_CLIENT_ID")
     csec = os.environ.get("CF_ACCESS_CLIENT_SECRET")
+    # 3. JSON file
     if not (cid and csec) and TOKEN_FILE.exists():
         tok = json.loads(TOKEN_FILE.read_text())
         cid = cid or tok.get("CF_ACCESS_CLIENT_ID")
         csec = csec or tok.get("CF_ACCESS_CLIENT_SECRET")
     if not (cid and csec):
-        sys.exit("Missing CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET "
-                 "(env or ~/.config/browser-pool/service-token.json)")
+        sys.exit("Missing BROWSER_TOKEN env OR CF_ACCESS_CLIENT_ID/SECRET "
+                 "OR ~/.config/browser-pool/service-token.json")
     return {"CF-Access-Client-Id": cid, "CF-Access-Client-Secret": csec}
 
 

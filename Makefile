@@ -3,6 +3,7 @@
 
 KUBECTL ?= kubectl
 NS      ?= browser-pool
+# Change to your own node (or override at call time: `make remote-apply ML110=root@your-node`)
 ML110   ?= root@100.108.4.108
 
 .PHONY: help bundle apply restart status logs smoke clean

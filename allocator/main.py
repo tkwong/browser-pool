@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field
 # Config (env-driven so the same image runs in any environment)               #
 # --------------------------------------------------------------------------- #
 POOL = [p.strip() for p in os.environ.get("POOL_PODS", "chrome-vnc-0").split(",") if p.strip()]
-POD_URL_TPL = os.environ.get("POD_URL_TEMPLATE", "https://{pod}.cartforge.net")
+POD_URL_TPL = os.environ.get("POD_URL_TEMPLATE", "")
 POD_INTERNAL_URL_TPL = os.environ.get(
     "POD_INTERNAL_URL_TEMPLATE",
     "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9223",

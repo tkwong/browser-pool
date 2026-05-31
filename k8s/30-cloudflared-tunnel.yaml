@@ -9,14 +9,15 @@
 #        kubectl -n browser-pool create secret generic cloudflared-tunnel \
 #          --from-literal=token='PASTE_TOKEN_HERE'
 #   4. In CF dashboard -> tunnel -> Public Hostnames, add:
-#        allocator.cartforge.net  -> http://allocator.browser-pool.svc.cluster.local
+#        allocator.<yourdomain>  -> http://allocator.browser-pool.svc.cluster.local
 #      (chrome-vnc per-pod hostnames are intentionally NOT exposed via this
 #      named tunnel — per-lease access goes through Quick Tunnels spawned by
 #      the allocator, gating by unguessable subdomain + short lifetime.)
-#      Legacy steel-{0..2}.cartforge.net hostnames in the CF dashboard are
-#      deprecated (Steel retired 2026-05-30); can be deleted manually.
-#   5. Access -> Applications -> Add Self-hosted for each hostname.
-#      - allocator : service token (for agents) + huskydata.io email (you)
+#   5. Access -> Applications -> Add Self-hosted for `allocator.<yourdomain>`,
+#      with TWO policies (per the service-token-non-identity footgun):
+#        - allow policy: include your email AND your service token(s)
+#        - non_identity policy: include only the service token(s)
+#      Both required: allow-only silently 302s service tokens.
 
 apiVersion: apps/v1
 kind: Deployment

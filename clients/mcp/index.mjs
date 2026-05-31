@@ -12,10 +12,16 @@
  *     Idle timer is PAUSED while a user-help session is open.
  *   - SIGTERM / SIGINT / process exit: release lease (best-effort).
  *
- * Required env (or sane defaults):
- *   ALLOCATOR_URL                  default https://allocator.cartforge.net
- *   ALLOCATOR_SERVICE_TOKEN_FILE   default ~/.config/browser-pool/service-token.json
- *                                  JSON: {"CF_ACCESS_CLIENT_ID":"…","CF_ACCESS_CLIENT_SECRET":"…"}
+ * Required env (no default — you MUST set one of):
+ *   BROWSER_POOL_URL               full allocator URL, e.g. https://allocator.example.com
+ *                                  (alias: ALLOCATOR_URL)
+ *
+ * Auth — pick one (first that resolves wins):
+ *   BROWSER_TOKEN                  "<client_id>:<client_secret>" colon-separated
+ *   ALLOCATOR_SERVICE_TOKEN_FILE   path to JSON file; default ~/.config/browser-pool/service-token.json
+ *                                  shape: {"CF_ACCESS_CLIENT_ID":"…","CF_ACCESS_CLIENT_SECRET":"…"}
+ *
+ * Optional:
  *   BROWSER_POOL_TIER              default "chrome-vnc"
  *   BROWSER_POOL_ACQUIRE_TTL       default 3600 (seconds)
  *   BROWSER_POOL_IDLE_RELEASE_MS   default 300000 (5 minutes)
@@ -35,7 +41,11 @@ import { join } from "node:path";
 // --------------------------------------------------------------------------- //
 //  Config                                                                     //
 // --------------------------------------------------------------------------- //
-const ALLOCATOR = process.env.ALLOCATOR_URL || "https://allocator.cartforge.net";
+const ALLOCATOR = process.env.BROWSER_POOL_URL || process.env.ALLOCATOR_URL;
+if (!ALLOCATOR) {
+  console.error("[browser-pool] FATAL: set BROWSER_POOL_URL (e.g. https://allocator.example.com)");
+  process.exit(2);
+}
 const TOKEN_FILE =
   process.env.ALLOCATOR_SERVICE_TOKEN_FILE ||
   join(homedir(), ".config", "browser-pool", "service-token.json");
@@ -46,9 +56,21 @@ const IDLE_RELEASE_MS = Number(
 );
 const IDLE_CHECK_MS = 30_000;
 
-// CF Access service-token headers (loaded from JSON file).
+// CF Access service-token headers. Resolution order:
+//   1. BROWSER_TOKEN env (colon-separated "client_id:client_secret")
+//   2. JSON file at ALLOCATOR_SERVICE_TOKEN_FILE / default path
 let CF_HEADERS = {};
-if (existsSync(TOKEN_FILE)) {
+if (process.env.BROWSER_TOKEN) {
+  const colon = process.env.BROWSER_TOKEN.indexOf(":");
+  if (colon < 0) {
+    console.error("[browser-pool] FATAL: BROWSER_TOKEN must be in '<client_id>:<client_secret>' form");
+    process.exit(2);
+  }
+  CF_HEADERS = {
+    "CF-Access-Client-Id": process.env.BROWSER_TOKEN.slice(0, colon),
+    "CF-Access-Client-Secret": process.env.BROWSER_TOKEN.slice(colon + 1),
+  };
+} else if (existsSync(TOKEN_FILE)) {
   try {
     const t = JSON.parse(readFileSync(TOKEN_FILE, "utf8"));
     CF_HEADERS = {
@@ -59,7 +81,7 @@ if (existsSync(TOKEN_FILE)) {
     console.error(`[browser-pool] failed to read ${TOKEN_FILE}: ${e.message}`);
   }
 } else {
-  console.error(`[browser-pool] no service-token file at ${TOKEN_FILE} — allocator calls will be unauthenticated (will 302 if Access is enforced)`);
+  console.error(`[browser-pool] no BROWSER_TOKEN env or token file at ${TOKEN_FILE} — allocator calls will fail with 302 if Access is enforced`);
 }
 
 // --------------------------------------------------------------------------- //

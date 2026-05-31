@@ -9,17 +9,24 @@ make smoke
 python3 tests/smoke.py
 ```
 
-預設打 `https://allocator.cartforge.net`(CF Access protected)。Credentials 自動從 `~/.config/browser-pool/service-token.json` 攞,或者 env override:
+需要 `BROWSER_POOL_URL` env(allocator base URL)。Credentials 三條 path 任揀其一:
 
 ```bash
-ALLOCATOR_URL=https://allocator.cartforge.net \
-CF_ACCESS_CLIENT_ID=xxx CF_ACCESS_CLIENT_SECRET=yyy \
+# 1. one-line BROWSER_TOKEN env (推 — 同 install-mcp.sh 一樣 shape):
+BROWSER_POOL_URL=https://allocator.example.com \
+BROWSER_TOKEN=<client_id>:<client_secret> \
 make smoke
+
+# 2. JSON file (default): ~/.config/browser-pool/service-token.json
+BROWSER_POOL_URL=https://allocator.example.com make smoke
+
+# 3. split env vars (legacy)
+BROWSER_POOL_URL=... CF_ACCESS_CLIENT_ID=... CF_ACCESS_CLIENT_SECRET=... make smoke
 ```
 
-成功收尾係 `PASS: 27   FAIL: 0`,exit code 0。
+成功收尾係 `PASS: 28   FAIL: 0`,exit code 0。
 
-## 27 個 check 涵蓋
+## 28 個 check 涵蓋
 
 | Step | 確認 |
 |---|---|

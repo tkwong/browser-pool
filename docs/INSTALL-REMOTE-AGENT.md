@@ -8,6 +8,30 @@
 
 ---
 
+## TL;DR — one-liner (preferred)
+
+If the operator has issued you a Cloudflare Access service token and given you the allocator URL, the entire install collapses to:
+
+```bash
+BROWSER_POOL_URL=https://allocator.<operator-domain> \
+BROWSER_TOKEN=<client_id>:<client_secret> \
+  bash <(curl -fsSL https://raw.githubusercontent.com/tkwong/browser-pool/main/scripts/install-mcp.sh)
+```
+
+The installer does prereq checks (Node 22+, claude CLI, network reach), clones the repo to `~/browser-pool`, installs deps, writes the token to `~/.config/browser-pool/service-token.json` (chmod 600), registers the MCP at user scope with `BROWSER_POOL_URL` baked in, then runs the 28-check smoke test. On success you'll see `PASS: 28   FAIL: 0` followed by a green completion box.
+
+After that: start a fresh Claude Code session (or `/mcp reconnect browser-pool` in an existing one) and the 22 `browser_*` tools are live.
+
+Skip directly to **§10. After install — confirm to the operator** to report back.
+
+---
+
+## Full manual path (for the curious or when the one-liner fails)
+
+The one-liner does each of these steps idempotently. Use this section if the one-liner errors out somewhere and you need to debug, or if your environment can't run the script as-is.
+
+---
+
 ## 0. Prerequisites — check first, fail fast
 
 ```bash
@@ -23,7 +47,7 @@ ls -la ~/.claude.json   # exists? writable?
 # Outbound network to the allocator (CF Tunnel hostname, public on the internet,
 # gated by CF Access). If this curl hangs or times out, ask the operator before
 # proceeding — likely a VPC egress / security group issue.
-curl -sS -o /dev/null -w "%{http_code}\n" https://allocator.cartforge.net/healthz
+curl -sS -o /dev/null -w "%{http_code}\n" "$BROWSER_POOL_URL/healthz"
 # Expect 401 or 302 (no token yet) — anything in 4xx/3xx means reachable.
 # 000 or timeout = network blocked, STOP here and report to operator.
 ```
@@ -47,7 +71,7 @@ git clone https://github.com/tkwong/browser-pool.git
 cd browser-pool/clients/mcp
 ```
 
-If you do not have git auth for a private repo, ask the operator to either (a) deploy a read-only SSH key for the EC2, or (b) use `gh repo clone tkwong/browser-pool` if `gh` is auth'd on this machine.
+The upstream repo is public; no git auth needed. If you're cloning a private fork instead, ask the operator for whichever auth pattern that fork uses.
 
 ---
 
@@ -74,7 +98,7 @@ The MCP authenticates to the allocator via a Cloudflare Access **service token**
 
 1. Open https://one.dash.cloudflare.com → Access → Service Auth → Service Tokens
 2. Create a new token with a descriptive name like `mcp-<agent-name>` (e.g. `mcp-asset-management`, `mcp-polynft`) so per-agent revoke is possible
-3. Add this token's id to the CF Access policy on the `allocator.cartforge.net` application (`Include → Service Auth Token → <new token>`)
+3. Add this token's id to the CF Access policy on the `allocator.<operator-domain>` application (`Include → Service Auth Token → <new token>`). Both the `allow` policy and the `non_identity` policy must include the token — `allow`-only causes silent 302 redirects.
 4. Send you back the JSON, shape:
 
 ```json
@@ -116,7 +140,7 @@ Before registering the MCP, prove the token works against the live allocator:
 CID=$(jq -r .CF_ACCESS_CLIENT_ID ~/.config/browser-pool/service-token.json)
 CSEC=$(jq -r .CF_ACCESS_CLIENT_SECRET ~/.config/browser-pool/service-token.json)
 
-curl -sS https://allocator.cartforge.net/healthz \
+curl -sS "$BROWSER_POOL_URL/healthz" \
   -H "CF-Access-Client-Id: $CID" \
   -H "CF-Access-Client-Secret: $CSEC" \
   | jq .
@@ -214,7 +238,7 @@ Full details: each tool's schema is in the MCP server registration; call `tool_s
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `claude mcp list` shows ✗ Failed | Node < 22 or syntax error from a corrupted git checkout | `node --version`; `cd ~/browser-pool && git status && git pull` |
-| Every `browser_*` errors `pool_exhausted` | Real exhaustion (someone else holds both pods) or your own token already has an active lease (429 surfaces as pool_exhausted in some client wrappers) | `curl https://allocator.cartforge.net/status -H ...` to see actual state; release any held lease |
+| Every `browser_*` errors `pool_exhausted` | Real exhaustion (someone else holds both pods) or your own token already has an active lease (429 surfaces as pool_exhausted in some client wrappers) | `curl "$BROWSER_POOL_URL/status" -H ...` to see actual state; release any held lease |
 | `browser_navigate` returns but page is blank | Chromium crashed mid-tab; liveness probe will restart container within ~90s | retry; if persistent, tell operator |
 | Token suddenly 401s | Operator rotated / revoked it | request new token, replace file |
 | View URL `DNS_PROBE_FINISHED_NXDOMAIN` | DNS propagation lag for trycloudflare subdomain (10-30s) | wait 30s, refresh |

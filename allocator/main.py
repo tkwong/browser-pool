@@ -70,6 +70,14 @@ CONTROL_PROFILE_TIMEOUT = int(os.environ.get("CONTROL_PROFILE_TIMEOUT_SECONDS", 
 PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", "/profiles"))
 _PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 
+# Audit log — JSONL on the same PVC as profiles. Append-only; one record per
+# acquire / release / exhausted / wipe / inject / dump. Keeps forever; rotate
+# manually if needed.
+AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH", str(PROFILES_DIR / "audit.log")))
+# Rolling 5-minute exhaustion counters for the admin queue view.
+_RECENT_EXHAUSTED: list[tuple[float, str]] = []   # (ts, "423"|"429")
+_RECENT_LOCK = threading.Lock()
+
 # Per-token rate limit. Quota key is the CF-Access-Client-Id header (preserved
 # by CF Access untouched; falls back to "anonymous" if absent for dev).
 # MAX_LEASES_PER_TOKEN caps concurrent active leases for one token —
@@ -228,6 +236,45 @@ def _check_auth(authz: Optional[str]) -> None:
 # --------------------------------------------------------------------------- #
 # Named-profile helpers                                                        #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Audit log                                                                   #
+# --------------------------------------------------------------------------- #
+def _audit(action: str, **fields: Any) -> None:
+    """Append one JSONL audit record. Never raises (best-effort)."""
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"ts": _now().isoformat(timespec="seconds"), "action": action, **fields}
+        with AUDIT_LOG_PATH.open("a") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception as e:                                            # noqa: BLE001
+        log.warning("audit write failed: %s", e)
+
+
+def _track_exhausted(kind: str) -> None:
+    """Slide a 5-min window of exhaustion events for the queue widget."""
+    now = time.time()
+    cutoff = now - 300
+    with _RECENT_LOCK:
+        _RECENT_EXHAUSTED.append((now, kind))
+        # Drop entries older than 5 min
+        while _RECENT_EXHAUSTED and _RECENT_EXHAUSTED[0][0] < cutoff:
+            _RECENT_EXHAUSTED.pop(0)
+
+
+def _recent_exhausted_summary() -> dict[str, int]:
+    cutoff = time.time() - 300
+    with _RECENT_LOCK:
+        items = [k for ts, k in _RECENT_EXHAUSTED if ts >= cutoff]
+    return {
+        "exhausted_attempts_5min": len(items),
+        "recent_423_pool_5min": items.count("423"),
+        "recent_429_quota_5min": items.count("429"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Profile helpers                                                              #
+# --------------------------------------------------------------------------- #
 def _profile_path(name: str) -> Path:
     if not _PROFILE_NAME_RE.match(name):
         raise HTTPException(status_code=400, detail="invalid profile name")
@@ -318,10 +365,12 @@ def acquire(
     req: AcquireReq,
     authorization: Optional[str] = Header(default=None),
     cf_access_client_id: Optional[str] = Header(default=None, alias="CF-Access-Client-Id"),
+    cf_connecting_ip: Optional[str] = Header(default=None, alias="CF-Connecting-IP"),
 ):
     _check_auth(authorization)
     ttl = req.ttl or DEFAULT_TTL
     quota_key = cf_access_client_id or "anonymous"
+    source_ip = cf_connecting_ip or "unknown"
     # Atomically check per-token quota + claim a pod slot. quota check is
     # inside the lock so a burst of concurrent acquires from one token can't
     # all slip through.
@@ -335,6 +384,9 @@ def acquire(
                 if st is not None and st.get("quota_key") == quota_key
             )
             if active_for_token >= MAX_LEASES_PER_TOKEN:
+                _track_exhausted("429")
+                _audit("exhausted_429", quota_key=quota_key, source_ip=source_ip,
+                       active_leases=active_for_token, max=MAX_LEASES_PER_TOKEN)
                 return JSONResponse(
                     status_code=429,
                     headers={"Retry-After": "30"},
@@ -356,10 +408,16 @@ def acquire(
                     "view_url": None,
                     "quota_key": quota_key,
                 }
+                # Track source for the admin view (not used for auth)
+                _state[pod]["source_ip"] = source_ip
+                _state[pod]["profile"] = req.profile
                 _lease_to_pod[lease_id] = pod
                 break
 
     if claimed_pod is None:
+        _track_exhausted("423")
+        _audit("exhausted_423", quota_key=quota_key, source_ip=source_ip,
+               pool_size=len(POOL))
         return JSONResponse(
             status_code=423,
             headers={"Retry-After": "30"},
@@ -401,6 +459,10 @@ def acquire(
             log.error("inject profile=%s pod=%s failed: %s", req.profile, claimed_pod, e)
             raise HTTPException(status_code=502, detail=f"inject failed: {e}") from e
 
+    _audit("acquire", lease_id=lease_id, pod=claimed_pod,
+           quota_key=quota_key, source_ip=source_ip,
+           ttl=ttl, profile=req.profile,
+           injected_cookies=(injected or {}).get("cookies") if injected else None)
     log.info("acquired pod=%s lease=%s tier=%s ttl=%s view_url=%s cdp_url=%s profile=%s",
              claimed_pod, lease_id, tier, ttl, view_url or "(none)", cdp_url or "(none)", req.profile or "(none)")
     return AcquireResp(
@@ -416,7 +478,12 @@ def acquire(
 
 
 @app.post("/release")
-def release(req: ReleaseReq, authorization: Optional[str] = Header(default=None)):
+def release(
+    req: ReleaseReq,
+    authorization: Optional[str] = Header(default=None),
+    cf_access_client_id: Optional[str] = Header(default=None, alias="CF-Access-Client-Id"),
+    cf_connecting_ip: Optional[str] = Header(default=None, alias="CF-Connecting-IP"),
+):
     _check_auth(authorization)
     with _lock:
         pod = _lease_to_pod.pop(req.lease_id, None)
@@ -447,6 +514,13 @@ def release(req: ReleaseReq, authorization: Optional[str] = Header(default=None)
     if old_state:
         _kill_quick_tunnel(old_state)
     _wipe_pod_profile(pod)
+    duration = None
+    if old_state and old_state.get("leased_at"):
+        duration = int((_now() - old_state["leased_at"]).total_seconds())
+    _audit("release", lease_id=req.lease_id, pod=pod,
+           quota_key=(cf_access_client_id or (old_state or {}).get("quota_key") or "anonymous"),
+           source_ip=(cf_connecting_ip or "unknown"),
+           save_as=req.save_as, duration_s=duration)
     log.info("released pod=%s lease=%s save_as=%s", pod, req.lease_id, req.save_as or "(none)")
     return {"released": True, "pod": pod, "saved_to": saved_to}
 
@@ -539,6 +613,269 @@ def healthz():
 
 
 # --------------------------------------------------------------------------- #
+# Admin                                                                        #
+# --------------------------------------------------------------------------- #
+def _sidecar_status(pod: str) -> dict[str, Any]:
+    """Best-effort fetch of the sidecar's /status (live chromium counters)."""
+    if not CONTROL_URL_TPL:
+        return {}
+    url = f"{CONTROL_URL_TPL.format(pod=pod)}/status"
+    try:
+        with httpx.Client(timeout=3.0) as c:
+            r = c.get(url)
+            if r.status_code != 200:
+                return {}
+            return r.json()
+    except Exception:                                                 # noqa: BLE001
+        return {}
+
+
+@app.get("/admin/status")
+def admin_status(authorization: Optional[str] = Header(default=None)):
+    """Detailed pool snapshot: per-pod lease + chromium sidecar info + queue.
+    Reused by both the HTML dashboard and direct API users."""
+    _check_auth(authorization)
+    with _lock:
+        snap = {pod: (st.copy() if st else None) for pod, st in _state.items()}
+    pods = []
+    for pod, st in snap.items():
+        side = _sidecar_status(pod)
+        if st is None:
+            pods.append({
+                "pod": pod, "free": True,
+                "chromium": side,
+            })
+        else:
+            age = int((_now() - st["leased_at"]).total_seconds()) if st.get("leased_at") else None
+            pods.append({
+                "pod": pod, "free": False,
+                "lease_id": st["lease_id"],
+                "leased_at": st["leased_at"].isoformat(),
+                "expires_at": st["expires_at"].isoformat(),
+                "age_seconds": age,
+                "quota_key": st.get("quota_key"),
+                "source_ip": st.get("source_ip"),
+                "profile": st.get("profile"),
+                "view_url": st.get("view_url"),
+                "chromium": side,
+            })
+    return {
+        "pool_size": len(POOL),
+        "free": sum(1 for p in pods if p["free"]),
+        "pods": pods,
+        "queue": _recent_exhausted_summary(),
+        "max_leases_per_token": MAX_LEASES_PER_TOKEN,
+    }
+
+
+@app.get("/admin/log")
+def admin_log(
+    limit: int = 200,
+    action: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Tail of the JSONL audit log. Newest first. Optional action= filter."""
+    _check_auth(authorization)
+    if not AUDIT_LOG_PATH.exists():
+        return {"entries": []}
+    # Cheap-ish: read up to N*512 bytes from end, parse last N entries.
+    cap = max(1, min(limit, 2000))
+    raw = AUDIT_LOG_PATH.read_text().splitlines()
+    entries: list[dict] = []
+    for line in reversed(raw):
+        try:
+            e = json.loads(line)
+            if action and e.get("action") != action:
+                continue
+            entries.append(e)
+            if len(entries) >= cap:
+                break
+        except Exception:                                             # noqa: BLE001
+            continue
+    return {"entries": entries, "total_in_file": len(raw)}
+
+
+_ADMIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>browser-pool · admin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --bg:#0c0e10; --bg2:#15181c; --bg3:#1d2126;
+      --fg:#e6e8eb; --muted:#9aa0a6; --border:#2a2f36;
+      --green:#34d399; --yellow:#fbbf24; --red:#f87171; --blue:#60a5fa;
+      --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 -apple-system,system-ui,Inter,sans-serif}
+    header{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid var(--border)}
+    header h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em}
+    header .meta{color:var(--muted);font-size:12px}
+    .stat-row{display:flex;gap:10px;padding:14px 22px;border-bottom:1px solid var(--border);background:var(--bg2)}
+    .stat{flex:1;padding:10px 14px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)}
+    .stat .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+    .stat .val{font-size:22px;font-weight:600;margin-top:4px;font-family:var(--mono)}
+    .stat.green .val{color:var(--green)}
+    .stat.yellow .val{color:var(--yellow)}
+    .stat.red .val{color:var(--red)}
+    nav.tabs{display:flex;border-bottom:1px solid var(--border);padding:0 22px;background:var(--bg)}
+    nav.tabs button{background:transparent;color:var(--muted);border:none;padding:14px 18px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+    nav.tabs button.active{color:var(--fg);border-bottom-color:var(--fg)}
+    main{padding:18px 22px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
+    th{color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.06em;background:var(--bg2)}
+    td.mono{font-family:var(--mono);font-size:12px}
+    td .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-family:var(--mono)}
+    .badge.live{background:rgba(52,211,153,.15);color:var(--green)}
+    .badge.free{background:var(--bg3);color:var(--muted)}
+    .badge.release{background:var(--bg3);color:var(--muted)}
+    .badge.expire{background:rgba(248,113,113,.15);color:var(--red)}
+    .badge.exhausted{background:rgba(251,191,36,.15);color:var(--yellow)}
+    .badge.acquire{background:rgba(96,165,250,.15);color:var(--blue)}
+    .badge.wipe,.badge.inject,.badge.dump{background:var(--bg3);color:var(--muted)}
+    a{color:var(--blue);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .empty{color:var(--muted);padding:24px;text-align:center}
+    .pill{padding:1px 6px;background:var(--bg3);border-radius:3px;font-family:var(--mono);font-size:11px}
+  </style>
+</head>
+<body>
+<header>
+  <h1>🪴 browser-pool · admin</h1>
+  <div class="meta">refreshes every 5 s · <span id="meta">…</span></div>
+</header>
+<div class="stat-row" id="stats"></div>
+<nav class="tabs">
+  <button data-tab="live" class="active">Live Sessions</button>
+  <button data-tab="all">All Sessions</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+<main id="content"></main>
+<script>
+const $ = s => document.querySelector(s);
+let cur = 'live';
+const fmtAge = s => {
+  if (s == null) return '—';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+};
+const tail10 = s => s ? s.slice(-10) : '—';
+const fmtDate = ts => new Date(ts).toLocaleString();
+const short = id => id ? id.slice(0,8) : '—';
+
+async function fetchStatus() {
+  const r = await fetch('/admin/status', {credentials:'include'});
+  return r.json();
+}
+async function fetchLog(limit=100) {
+  const r = await fetch('/admin/log?limit=' + limit, {credentials:'include'});
+  return r.json();
+}
+
+function renderStats(s) {
+  const q = s.queue || {};
+  $('#stats').innerHTML = `
+    <div class="stat green"><div class="label">Free / Pool</div><div class="val">${s.free} / ${s.pool_size}</div></div>
+    <div class="stat"><div class="label">Quota cap (per token)</div><div class="val">${s.max_leases_per_token || '∞'}</div></div>
+    <div class="stat yellow"><div class="label">Pool exhaustions (5 min)</div><div class="val">${q.recent_423_pool_5min || 0}</div></div>
+    <div class="stat yellow"><div class="label">Quota rejections (5 min)</div><div class="val">${q.recent_429_quota_5min || 0}</div></div>
+  `;
+}
+
+function renderLive(s) {
+  if (!s.pods.length) return '<div class="empty">no pods</div>';
+  const rows = s.pods.map(p => {
+    const c = p.chromium || {};
+    return `<tr>
+      <td class="mono">${p.pod}</td>
+      <td>${p.free ? '<span class="badge free">free</span>' : '<span class="badge live">live</span>'}</td>
+      <td class="mono">${short(p.lease_id)}</td>
+      <td class="mono"><span class="pill">${tail10(p.quota_key)}</span></td>
+      <td class="mono">${p.source_ip || '—'}</td>
+      <td>${p.profile || '—'}</td>
+      <td class="mono">${fmtAge(p.age_seconds)}</td>
+      <td class="mono">${c.chromium_alive ? '✓' : '✗'} ${c.cookie_count != null ? c.cookie_count + 'c' : ''} ${c.target_count != null ? c.target_count + 't' : ''}</td>
+      <td>${p.view_url ? '<a href="' + p.view_url + '" target="_blank">open</a>' : '—'}</td>
+    </tr>`;
+  }).join('');
+  return `<table>
+    <thead><tr>
+      <th>Pod</th><th>Status</th><th>Lease ID</th><th>Token</th><th>Source IP</th>
+      <th>Profile</th><th>Age</th><th>Chromium</th><th>Viewer</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderAll(log) {
+  const entries = log.entries || [];
+  if (!entries.length) return '<div class="empty">no audit entries yet</div>';
+  const rows = entries.map(e => `<tr>
+    <td class="mono">${fmtDate(e.ts)}</td>
+    <td><span class="badge ${e.action.split('_')[0]}">${e.action}</span></td>
+    <td class="mono">${short(e.lease_id)}</td>
+    <td class="mono">${e.pod || '—'}</td>
+    <td class="mono"><span class="pill">${tail10(e.quota_key)}</span></td>
+    <td class="mono">${e.source_ip || '—'}</td>
+    <td class="mono">${e.duration_s != null ? fmtAge(e.duration_s) : '—'}</td>
+    <td>${e.profile || e.save_as || '—'}</td>
+  </tr>`).join('');
+  return `<table>
+    <thead><tr>
+      <th>When</th><th>Action</th><th>Lease ID</th><th>Pod</th>
+      <th>Token</th><th>Source IP</th><th>Duration</th><th>Profile</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <div class="empty">showing ${entries.length} of ${log.total_in_file} total entries</div>`;
+}
+
+function renderSettings(s) {
+  return `<div class="empty">
+    <p>Read-only snapshot for v1.</p>
+    <table style="max-width:600px;margin:0 auto">
+      <tr><td>Pool size</td><td class="mono">${s.pool_size}</td></tr>
+      <tr><td>MAX_LEASES_PER_TOKEN</td><td class="mono">${s.max_leases_per_token || 'disabled'}</td></tr>
+    </table>
+    <p style="margin-top:24px">Future: profile mgmt UI, lease force-release, rate-limit tune, alert rules.</p>
+  </div>`;
+}
+
+async function refresh() {
+  try {
+    const s = await fetchStatus();
+    renderStats(s);
+    if (cur === 'live') $('#content').innerHTML = renderLive(s);
+    else if (cur === 'all') $('#content').innerHTML = renderAll(await fetchLog(200));
+    else $('#content').innerHTML = renderSettings(s);
+    $('#meta').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('#meta').textContent = 'ERR: ' + e.message;
+  }
+}
+
+document.querySelectorAll('nav.tabs button').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('nav.tabs button').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    cur = b.dataset.tab;
+    refresh();
+  };
+});
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/admin")
+def admin_html():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(_ADMIN_HTML)
+
+
+# --------------------------------------------------------------------------- #
 # Background reaper                                                           #
 # --------------------------------------------------------------------------- #
 def _reaper() -> None:
@@ -556,6 +893,11 @@ def _reaper() -> None:
         for pod, st in expired:
             _kill_quick_tunnel(st)
             _wipe_pod_profile(pod)
+            duration = int((_now() - st["leased_at"]).total_seconds()) if st.get("leased_at") else None
+            _audit("expire", lease_id=st["lease_id"], pod=pod,
+                   quota_key=st.get("quota_key", "anonymous"),
+                   source_ip=st.get("source_ip", "unknown"),
+                   duration_s=duration)
 
 
 threading.Thread(target=_reaper, daemon=True, name="reaper").start()

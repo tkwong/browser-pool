@@ -62,9 +62,10 @@ spec:
                 fastapi==0.115.0 uvicorn==0.30.6 httpx==0.27.2 'pydantic>=2.9,<3'
               exec uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
           env:
-            # v2: chrome-vnc × 2 replicas (scale 3→2 for ML110 RAM budget,
-            # bump back when 32GB upgrade lands). Per-pod NodePort for CDP.
-            - { name: POOL_PODS,                value: "chrome-vnc-0,chrome-vnc-1" }
+            # chrome-vnc × 6 replicas (Proxmox migration 2026-06-16; the k3s VM
+            # has the RAM headroom the old ML110 node lacked). Keep POOL_PODS, the
+            # StatefulSet replicas (k8s/40), and CDP_URL_CHROME_VNC_* all in sync.
+            - { name: POOL_PODS,                value: "chrome-vnc-0,chrome-vnc-1,chrome-vnc-2,chrome-vnc-3,chrome-vnc-4,chrome-vnc-5" }
             - { name: DEFAULT_TIER,             value: "chrome-vnc" }
             # Per-pod CF Tunnel hostname template (informational only; the
             # client uses cdp_url + view_url, not pod_url). Change to your
@@ -79,6 +80,10 @@ spec:
             # lower latency, but no longer the published path.
             - { name: CDP_URL_CHROME_VNC_0,     value: "https://cdp-chrome-vnc-0.cartforge.net" }
             - { name: CDP_URL_CHROME_VNC_1,     value: "https://cdp-chrome-vnc-1.cartforge.net" }
+            - { name: CDP_URL_CHROME_VNC_2,     value: "https://cdp-chrome-vnc-2.cartforge.net" }
+            - { name: CDP_URL_CHROME_VNC_3,     value: "https://cdp-chrome-vnc-3.cartforge.net" }
+            - { name: CDP_URL_CHROME_VNC_4,     value: "https://cdp-chrome-vnc-4.cartforge.net" }
+            - { name: CDP_URL_CHROME_VNC_5,     value: "https://cdp-chrome-vnc-5.cartforge.net" }
             # Per-pod control-sidecar URL template — allocator POSTs /wipe on release.
             - { name: CONTROL_URL_TEMPLATE,     value: "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9224" }
             - { name: QUICK_TUNNEL_TARGET_PORT, value: "3000" }                          # noVNC

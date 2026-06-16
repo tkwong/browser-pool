@@ -3,8 +3,14 @@
 
 KUBECTL ?= kubectl
 NS      ?= browser-pool
-# Change to your own node (or override at call time: `make remote-apply ML110=root@your-node`)
-ML110   ?= root@100.108.4.108
+# Deploy entry point. NOTE (2026-06-16 Proxmox migration): k3s now runs INSIDE a
+# VM ("k3s-browser-pool", LAN 192.168.68.50, login debian + sudo k3s kubectl),
+# reached by jumping through the Proxmox host (Tailscale "proxmox" =
+# root@100.74.210.36). `remote-apply` below assumes k3s-on-target and does NOT
+# perform that jump — it needs rework before it works against the VM topology
+# (see CLAUDE.md). Until then deploy single objects manually over the jump.
+# Override per call: `make remote-apply ML110=root@your-node`.
+ML110   ?= root@100.74.210.36
 
 .PHONY: help bundle apply restart status logs smoke integration clean
 

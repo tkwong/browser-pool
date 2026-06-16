@@ -59,6 +59,20 @@ data:
         default http;
         https   https;
       }
+      # Public host for the rewritten webSocketDebuggerUrl. The CF Tunnel path
+      # (X-Forwarded-Proto=https) MUST NOT trust the incoming Host header — a
+      # misconfigured tunnel can forward "Host: localhost" (the 2026-06-16
+      # Proxmox migration did exactly that → wss://localhost/... → connectOverCDP
+      # broke pool-wide while smoke stayed green). Derive it from the pod's own
+      # name instead: nginx $hostname = StatefulSet pod name (chrome-vnc-0), so
+      # cdp-$hostname.cartforge.net = the published CF Tunnel hostname (must match
+      # the allocator's CDP_URL_CHROME_VNC_N). The operator NodePort path (no
+      # X-Forwarded-Proto) keeps $http_host = the NodePort address it dialed,
+      # which is already correct — so only the https branch is overridden.
+      map $http_x_forwarded_proto $cdp_pub_host {
+        default $http_host;
+        https   "cdp-$hostname.cartforge.net";
+      }
       server {
         listen 9223;
         # Long timeouts for CDP WebSocket (DevTools page sessions can be long-lived).
@@ -76,8 +90,8 @@ data:
           proxy_set_header Accept-Encoding "";       # disable gzip so sub_filter runs
           sub_filter_types application/json;
           sub_filter_once off;
-          sub_filter 'ws://localhost/'   '$cdp_ws_scheme://$http_host/';
-          sub_filter 'http://localhost/' '$cdp_http_scheme://$http_host/';
+          sub_filter 'ws://localhost/'   '$cdp_ws_scheme://$cdp_pub_host/';
+          sub_filter 'http://localhost/' '$cdp_http_scheme://$cdp_pub_host/';
         }
       }
     }
@@ -87,8 +101,12 @@ data:
 # requirement. PoC = 1 replica, no allocator integration yet.
 #
 # - noVNC web UI on container port 3000  -> exposed via Quick Tunnel (magic-link)
-# - CDP                on container port 9222 -> exposed on host NodePort (Tailscale-reachable)
-#                                               so playwright-mcp can do --cdp-endpoint=ws://100.108.4.108:30922
+# - CDP                on container port 9222 -> exposed on host NodePort (Tailscale-reachable),
+#                                               OPERATOR-ONLY / low-latency direct path
+#                                               (--cdp-endpoint=ws://100.108.4.108:30922).
+#   NOTE: remote AGENTS do NOT use this NodePort. The allocator hands them the
+#   public CF Tunnel CDP hostname (cdp-<pod>.cartforge.net). Never tell an agent
+#   to enable Tailscale to reach CDP (v2.5 fix, 2026-05-31).
 #
 # We base on lscr.io/linuxserver/chromium because it ships the whole
 # Xvfb+Openbox+noVNC+Chromium stack out of the box. If we need Google Chrome
@@ -142,8 +160,10 @@ spec:
   ports:
     - { name: cdp, port: 9223, targetPort: 9223, nodePort: 30923 }
 ---
-# chrome-vnc-cdp-2 dropped 2026-05-30 (scale 3 → 2 for ML110 RAM budget).
-# Restore + bump replicas back to 3 when ML110 32GB upgrade is in.
+# NodePort services exist only for chrome-vnc-0/1 (operator Tailscale path).
+# Pods 2-5 (added in the 2026-06-16 Proxmox scale-up to 6) are reachable by
+# agents via CF Tunnel only — no NodePort needed. Add entries here only if an
+# operator needs direct low-latency CDP to pods 2-5.
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -152,7 +172,7 @@ metadata:
   namespace: browser-pool
 spec:
   serviceName: chrome-vnc
-  replicas: 2
+  replicas: 6
   # podManagementPolicy: Parallel would be nicer but the field is immutable on
   # an existing StatefulSet. Sticking with OrderedReady (default).
   selector: { matchLabels: { app: chrome-vnc } }

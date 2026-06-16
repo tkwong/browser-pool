@@ -44,11 +44,15 @@ POD_INTERNAL_URL_TPL = os.environ.get(
     "POD_INTERNAL_URL_TEMPLATE",
     "http://{pod}.chrome-vnc.browser-pool.svc.cluster.local:9223",
 )
-# CDP URL handed to agents (e.g. playwright-mcp via browser-pool-mcp). For
-# chrome-vnc tier this points at the Tailscale-reachable NodePort relayed by
-# the nginx sidecar (modern Chromium binds CDP to 127.0.0.1 only). Per-pod
-# CDP_URL_{POD} env overrides take priority over the global template.
-CDP_URL_TPL = os.environ.get("CDP_URL_TEMPLATE", "")  # e.g. "http://100.108.4.108:30922"
+# CDP URL handed to agents (e.g. playwright-mcp via browser-pool-mcp). For the
+# chrome-vnc tier this is the PUBLIC CF Tunnel hostname (cdp-<pod>.cartforge.net,
+# gated by CF Access) so remote agents NOT on the operator's tailnet can reach
+# it. NEVER hand agents the Tailscale NodePort (100.x) — that was the v2.5 fix,
+# 2026-05-31, after a remote EC2 timed out on the tailnet-only CDP URL. The
+# nginx sidecar relays to chromium (which binds CDP to 127.0.0.1 only). Per-pod
+# CDP_URL_{POD} env overrides take priority over the global template; in prod
+# they are set to the CF Tunnel hostnames in k8s/20-allocator.yaml.
+CDP_URL_TPL = os.environ.get("CDP_URL_TEMPLATE", "")  # global fallback; prod sets per-pod CDP_URL_CHROME_VNC_{0,1}=https://cdp-chrome-vnc-{0,1}.cartforge.net
 DEFAULT_TIER = os.environ.get("DEFAULT_TIER", "chrome-vnc")
 # DNS hostname template the Quick Tunnel cloudflared resolves. chrome-vnc pods
 # sit behind a headless Service named "chrome-vnc".

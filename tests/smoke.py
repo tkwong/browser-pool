@@ -12,7 +12,9 @@ Covers:
   7. cleanup: DELETE both profiles
 
 Does NOT need Playwright or k8s — talks only to the allocator HTTP surface
-(over CF Access). Run from anywhere with Tailscale or public internet.
+(over CF Access). Run from anywhere over the public internet with a CF Access
+service token; Tailscale is NOT required (agents reach the allocator + CDP via
+the public CF Tunnel, not the operator-only NodePort).
 
 Usage:
     pip install httpx

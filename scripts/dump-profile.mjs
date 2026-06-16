@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Dump cookies + storage from a logged-in chrome-vnc pod to a portable JSON
-// profile. Connects via CDP NodePort over Tailscale (no allocator needed).
+// profile. OPERATOR-ONLY tool: connects directly via the CDP NodePort over
+// Tailscale (no allocator). Remote agents must NOT use this path — they reach
+// CDP through the allocator's public CF Tunnel hostname (cdp-<pod>.cartforge.net).
 //
 // Usage:
 //   node scripts/dump-profile.mjs <domain-filter> <output-path>

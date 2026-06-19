@@ -16,6 +16,7 @@ Auth (optional): if ALLOCATOR_SERVICE_TOKEN is set, every mutating call must
 present `Authorization: Bearer <token>`.
 """
 
+import base64
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -241,6 +242,50 @@ def _check_auth(authz: Optional[str]) -> None:
 # Named-profile helpers                                                        #
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
+# Request identity                                                            #
+# --------------------------------------------------------------------------- #
+# CF Access consumes CF-Access-Client-Id/Secret at the edge — they do NOT reach
+# the origin. Instead Access forwards a signed JWT in `Cf-Access-Jwt-Assertion`
+# whose `common_name` claim is the service-token client_id (or `email` for SSO).
+# CF-Connecting-IP is also absent over this tunnel; the real client IP arrives
+# in `X-Forwarded-For`. Verified live 2026-06-19 via /admin/whoami.
+def _decode_cf_identity(jwt_assertion: Optional[str]) -> Optional[str]:
+    """Pull the caller identity from the CF Access JWT. We do NOT verify the
+    signature — Access already validated it at the edge before forwarding; we
+    only need a stable bucket key for quota + audit. Returns None if absent."""
+    if not jwt_assertion:
+        return None
+    try:
+        payload_b64 = jwt_assertion.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)            # restore padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("common_name") or payload.get("email") or payload.get("sub")
+    except Exception:                                                 # noqa: BLE001
+        return None
+
+
+def _caller_identity(
+    cf_jwt: Optional[str],
+    cf_access_client_id: Optional[str],
+    x_forwarded_for: Optional[str],
+    cf_connecting_ip: Optional[str],
+) -> tuple[str, str]:
+    """Returns (quota_key, source_ip). quota_key buckets the rate-limit and
+    labels audit rows; source_ip is the real visitor IP."""
+    quota_key = (
+        _decode_cf_identity(cf_jwt)
+        or cf_access_client_id            # if a future tunnel does forward it
+        or "anonymous"
+    )
+    source_ip = "unknown"
+    if x_forwarded_for:
+        source_ip = x_forwarded_for.split(",")[0].strip()   # first hop = client
+    elif cf_connecting_ip:
+        source_ip = cf_connecting_ip
+    return quota_key, source_ip
+
+
+# --------------------------------------------------------------------------- #
 # Audit log                                                                   #
 # --------------------------------------------------------------------------- #
 def _audit(action: str, **fields: Any) -> None:
@@ -368,13 +413,14 @@ class ReleaseReq(BaseModel):
 def acquire(
     req: AcquireReq,
     authorization: Optional[str] = Header(default=None),
+    cf_jwt: Optional[str] = Header(default=None, alias="Cf-Access-Jwt-Assertion"),
     cf_access_client_id: Optional[str] = Header(default=None, alias="CF-Access-Client-Id"),
+    x_forwarded_for: Optional[str] = Header(default=None, alias="X-Forwarded-For"),
     cf_connecting_ip: Optional[str] = Header(default=None, alias="CF-Connecting-IP"),
 ):
     _check_auth(authorization)
     ttl = req.ttl or DEFAULT_TTL
-    quota_key = cf_access_client_id or "anonymous"
-    source_ip = cf_connecting_ip or "unknown"
+    quota_key, source_ip = _caller_identity(cf_jwt, cf_access_client_id, x_forwarded_for, cf_connecting_ip)
     # Atomically check per-token quota + claim a pod slot. quota check is
     # inside the lock so a burst of concurrent acquires from one token can't
     # all slip through.
@@ -485,10 +531,13 @@ def acquire(
 def release(
     req: ReleaseReq,
     authorization: Optional[str] = Header(default=None),
+    cf_jwt: Optional[str] = Header(default=None, alias="Cf-Access-Jwt-Assertion"),
     cf_access_client_id: Optional[str] = Header(default=None, alias="CF-Access-Client-Id"),
+    x_forwarded_for: Optional[str] = Header(default=None, alias="X-Forwarded-For"),
     cf_connecting_ip: Optional[str] = Header(default=None, alias="CF-Connecting-IP"),
 ):
     _check_auth(authorization)
+    rel_quota_key, rel_source_ip = _caller_identity(cf_jwt, cf_access_client_id, x_forwarded_for, cf_connecting_ip)
     with _lock:
         pod = _lease_to_pod.pop(req.lease_id, None)
         if not pod:
@@ -522,8 +571,9 @@ def release(
     if old_state and old_state.get("leased_at"):
         duration = int((_now() - old_state["leased_at"]).total_seconds())
     _audit("release", lease_id=req.lease_id, pod=pod,
-           quota_key=(cf_access_client_id or (old_state or {}).get("quota_key") or "anonymous"),
-           source_ip=(cf_connecting_ip or "unknown"),
+           quota_key=(rel_quota_key if rel_quota_key != "anonymous"
+                      else (old_state or {}).get("quota_key", "anonymous")),
+           source_ip=rel_source_ip,
            save_as=req.save_as, duration_s=duration)
     log.info("released pod=%s lease=%s save_as=%s", pod, req.lease_id, req.save_as or "(none)")
     return {"released": True, "pod": pod, "saved_to": saved_to}
@@ -614,6 +664,22 @@ def status():
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "pool": POOL}
+
+
+@app.get("/admin/whoami")
+def whoami(request: Request, authorization: Optional[str] = Header(default=None)):
+    """Operator probe: echo the CF/identity-relevant request headers the origin
+    actually receives, so we can wire quota_key/source_ip to the right source.
+    Values are truncated; never returns full secrets."""
+    _check_auth(authorization)
+    interesting = {}
+    for k, v in request.headers.items():
+        kl = k.lower()
+        if kl.startswith("cf-") or kl.startswith("x-forwarded") or kl in ("true-client-ip",):
+            # Truncate long values (JWTs) so we see presence + shape, not full token
+            interesting[kl] = v if len(v) <= 48 else f"{v[:24]}…({len(v)} chars)"
+    return {"client_host": request.client.host if request.client else None,
+            "cf_headers": interesting}
 
 
 # --------------------------------------------------------------------------- #

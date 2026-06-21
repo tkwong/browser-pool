@@ -843,6 +843,15 @@ _ADMIN_HTML = """<!doctype html>
     .subtabs button.active{color:var(--fg);border-color:var(--fg)}
     .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
     .status-dot.active{background:var(--green)} .status-dot.released{background:var(--muted)} .status-dot.expired{background:var(--red)}
+    tr.grp{cursor:pointer} tr.grp:hover{background:var(--bg2)}
+    .caret{display:inline-block;width:12px;color:var(--muted);font-size:10px}
+    tr.detail>td{background:var(--bg);padding:0}
+    .detailwrap{padding:12px 16px 14px 38px;border-left:2px solid var(--blue);margin:2px 0 6px}
+    .detailwrap .tl{color:var(--muted);font-size:12px;font-family:var(--mono);margin-bottom:10px}
+    .tabrow{margin:6px 0}
+    .tabhead{display:block;color:var(--fg);font-size:12px;margin-bottom:2px}
+    .chain{font-family:var(--mono);font-size:12px;color:var(--muted);word-break:break-all;line-height:1.6}
+    .chain .arrow{color:var(--blue);padding:0 2px}
   </style>
 </head>
 <body>
@@ -861,6 +870,7 @@ _ADMIN_HTML = """<!doctype html>
 const $ = s => document.querySelector(s);
 let cur = 'live';
 let allView = 'grouped';   // All Sessions sub-view: grouped-by-session | flat
+let expanded = new Set();  // lease_ids whose per-session detail is drilled open
 const fmtAge = s => {
   if (s == null) return '—';
   if (s < 60) return s + 's';
@@ -928,6 +938,26 @@ function renderLive(s) {
 }
 
 function setAllView(v){ allView = v; refresh(); }
+function toggleExpand(lid){ if (expanded.has(lid)) expanded.delete(lid); else expanded.add(lid); refresh(); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// Per-session drill-down: the lease's timeline + every tab's FULL URL chain
+// (untruncated, unlike the Sites column). Data is already in the audit rows.
+function renderDetail(r){
+  const a = r.a, end = r.end;
+  let tl = 'acquired ' + fmtDate(a.ts);
+  if (a.ttl) tl += ' · ttl ' + a.ttl + 's';
+  if (end) tl += ' · ' + (end.action === 'expire' ? 'expired' : 'released') + ' ' + fmtDate(end.ts) + ' · ' + fmtAge(r.dur);
+  else tl += ' · still active';
+  if (end && end.save_as) tl += ' · saved as ' + esc(end.save_as);
+  const tabs = r.tabs || [];
+  const body = tabs.length ? tabs.map((t,i) => {
+    const chain = ((t.history && t.history.length) ? t.history : [t.url]).filter(Boolean);
+    return `<div class="tabrow"><span class="tabhead">tab ${i+1}${t.title ? ' · ' + esc(t.title) : ''}</span>`
+      + `<div class="chain">${chain.map(esc).join(' <span class="arrow">→</span> ')}</div></div>`;
+  }).join('') : '<div class="chain">no tab history captured for this session</div>';
+  return `<div class="detailwrap"><div class="tl">${tl}</div>${body}</div>`;
+}
 function subtabsBar(){
   return `<div class="subtabs">
     <button class="${allView==='grouped'?'active':''}" onclick="setAllView('grouped')">Grouped by session</button>
@@ -960,17 +990,22 @@ function renderGrouped(log) {
     const dur = end ? end.duration_s : Math.floor((Date.now() - Date.parse(a.ts))/1000);
     return { lid, a, end, status, startTs: a.ts, dur, tabs: end ? end.tabs : null };
   }).sort((x,y) => Date.parse(y.startTs) - Date.parse(x.startTs));
-  const trs = rows.map(r => `<tr>
-    <td><span class="status-dot ${r.status}"></span>${r.status}</td>
-    <td class="mono">${fmtDate(r.startTs)}</td>
-    <td class="mono">${short(r.lid)}</td>
-    <td class="mono">${r.a.pod || '—'}</td>
-    <td class="mono"><span class="pill">${tail10(r.a.quota_key)}</span></td>
-    <td class="mono">${r.a.source_ip || '—'}</td>
-    <td class="mono">${r.dur != null ? fmtAge(r.dur) : '—'}</td>
-    ${sitesCell(r.tabs)}
-    <td>${r.a.profile || (r.end && r.end.save_as) || '—'}</td>
-  </tr>`).join('');
+  const trs = rows.map(r => {
+    const open = expanded.has(r.lid);
+    const main = `<tr class="grp" onclick="toggleExpand('${r.lid}')">
+      <td><span class="caret">${open?'▾':'▸'}</span><span class="status-dot ${r.status}"></span>${r.status}</td>
+      <td class="mono">${fmtDate(r.startTs)}</td>
+      <td class="mono">${short(r.lid)}</td>
+      <td class="mono">${r.a.pod || '—'}</td>
+      <td class="mono"><span class="pill">${tail10(r.a.quota_key)}</span></td>
+      <td class="mono">${r.a.source_ip || '—'}</td>
+      <td class="mono">${r.dur != null ? fmtAge(r.dur) : '—'}</td>
+      ${sitesCell(r.tabs)}
+      <td>${r.a.profile || (r.end && r.end.save_as) || '—'}</td>
+    </tr>`;
+    const detail = open ? `<tr class="detail"><td colspan="9">${renderDetail(r)}</td></tr>` : '';
+    return main + detail;
+  }).join('');
   const rej = rejects ? `<div class="empty">+ ${rejects} rejected acquire attempt(s) (quota / pool full) in this window</div>` : '';
   return subtabsBar() + `<table><thead><tr>
       <th>Status</th><th>Started</th><th>Lease</th><th>Pod</th><th>Token</th>

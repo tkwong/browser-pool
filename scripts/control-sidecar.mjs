@@ -13,6 +13,10 @@
 //                         → { schema, saved_at, cookies, origins[{origin, localStorage}] }
 //   POST /inject-profile  body: profile JSON (same shape dump produces)
 //                         → { injected, cookies, origins }
+//   GET  /tabs            → { tabs: [{ url, title, history: [urls] }], at }
+//                           per open page target, its back/forward nav stack
+//                           (Page.getNavigationHistory). Read-only; the
+//                           allocator snapshots this at release for the audit log.
 
 import http from 'node:http'
 
@@ -253,6 +257,32 @@ async function status() {
   return { chromium_alive: alive, cookie_count: cookieCount, target_count: targetCount, last_wipe_at: lastWipe }
 }
 
+// --- TABS (browsing history) --- //
+// For each open page target, return its navigation stack via
+// Page.getNavigationHistory. Captures the journey within still-open tabs
+// (A->B->C). Closed tabs are gone — this is a release-time snapshot, not a
+// continuous recorder. Read-only: opens no tabs, hits no network.
+async function tabs() {
+  const targets = (await listTargets()).filter(t => t.type === 'page')
+  const out = []
+  for (const t of targets) {
+    let history = []
+    if (t.webSocketDebuggerUrl) {
+      try {
+        const page = await pageClient(t.webSocketDebuggerUrl)
+        try {
+          const nav = await page.send('Page.getNavigationHistory')
+          history = (nav.entries || [])
+            .map(e => e.url)
+            .filter(u => u && u !== 'about:blank')
+        } finally { page.close() }
+      } catch {}
+    }
+    out.push({ url: t.url, title: t.title || '', history })
+  }
+  return { tabs: out, at: new Date().toISOString() }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')
   res.setHeader('Content-Type', 'application/json')
@@ -260,6 +290,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/wipe')             res.end(JSON.stringify(await wipe()))
     else if (req.method === 'POST' && url.pathname === '/dump-profile') res.end(JSON.stringify(await dumpProfile(await readBody(req))))
     else if (req.method === 'POST' && url.pathname === '/inject-profile') res.end(JSON.stringify(await injectProfile(await readBody(req))))
+    else if (req.method === 'GET' && url.pathname === '/tabs')          res.end(JSON.stringify(await tabs()))
     else if (req.method === 'GET' && url.pathname === '/status')       res.end(JSON.stringify(await status()))
     else if (req.method === 'GET' && url.pathname === '/healthz')      res.end(JSON.stringify({ ok: true }))
     else { res.statusCode = 404; res.end(JSON.stringify({ error: 'not_found' })) }

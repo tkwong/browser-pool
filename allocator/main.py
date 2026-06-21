@@ -564,6 +564,8 @@ def release(
             except Exception as e:                                    # noqa: BLE001
                 log.error("save_as=%s pod=%s failed: %s — wipe still proceeds", req.save_as, pod, e)
 
+    # Snapshot tabs + nav history BEFORE wipe (wipe navigates tabs to about:blank).
+    tabs = _sidecar_tabs(pod)
     if old_state:
         _kill_quick_tunnel(old_state)
     _wipe_pod_profile(pod)
@@ -574,7 +576,7 @@ def release(
            quota_key=(rel_quota_key if rel_quota_key != "anonymous"
                       else (old_state or {}).get("quota_key", "anonymous")),
            source_ip=rel_source_ip,
-           save_as=req.save_as, duration_s=duration)
+           save_as=req.save_as, duration_s=duration, tabs=tabs)
     log.info("released pod=%s lease=%s save_as=%s", pod, req.lease_id, req.save_as or "(none)")
     return {"released": True, "pod": pod, "saved_to": saved_to}
 
@@ -698,6 +700,30 @@ def _sidecar_status(pod: str) -> dict[str, Any]:
             return r.json()
     except Exception:                                                 # noqa: BLE001
         return {}
+
+
+def _sidecar_tabs(pod: str) -> list[dict]:
+    """Best-effort snapshot of the pod's open tabs + per-tab nav history, taken
+    BEFORE wipe so the audit log records where the lease went. Tolerant of an
+    old sidecar without /tabs (404 -> []). Size-capped to keep audit lines sane.
+    """
+    if not CONTROL_URL_TPL:
+        return []
+    url = f"{CONTROL_URL_TPL.format(pod=pod)}/tabs"
+    try:
+        with httpx.Client(timeout=8.0) as c:
+            r = c.get(url)
+            if r.status_code != 200:
+                return []
+            tabs = r.json().get("tabs", [])
+    except Exception:                                                 # noqa: BLE001
+        return []
+    # Cap: at most 20 tabs, each history at most 25 most-recent URLs.
+    out = []
+    for t in tabs[:20]:
+        hist = [u for u in (t.get("history") or []) if u][-25:]
+        out.append({"url": t.get("url"), "title": (t.get("title") or "")[:120], "history": hist})
+    return out
 
 
 @app.get("/admin/status")
@@ -836,6 +862,20 @@ const fmtAge = s => {
 const tail10 = s => s ? s.slice(-10) : '—';
 const fmtDate = ts => new Date(ts).toLocaleString();
 const short = id => id ? id.slice(0,8) : '—';
+const sitesSummary = tabs => {
+  if (!Array.isArray(tabs) || !tabs.length) return '—';
+  const hosts = new Set();
+  for (const t of tabs) {
+    const urls = [t.url, ...(t.history || [])];
+    for (const u of urls) {
+      try { const h = new URL(u).hostname; if (h) hosts.add(h); } catch {}
+    }
+  }
+  if (!hosts.size) return '—';
+  const arr = [...hosts];
+  const shown = arr.slice(0, 4).join(', ');
+  return arr.length > 4 ? shown + ` +${arr.length - 4}` : shown;
+};
 
 async function fetchStatus() {
   const r = await fetch('/admin/status', {credentials:'include'});
@@ -890,14 +930,15 @@ function renderAll(log) {
     <td class="mono"><span class="pill">${tail10(e.quota_key)}</span></td>
     <td class="mono">${e.source_ip || '—'}</td>
     <td class="mono">${e.duration_s != null ? fmtAge(e.duration_s) : '—'}</td>
+    <td title="${(e.tabs||[]).flatMap(t=>[t.url,...(t.history||[])]).filter(Boolean).join('\\n')}">${sitesSummary(e.tabs)}</td>
     <td>${e.profile || e.save_as || '—'}</td>
   </tr>`).join('');
   return `<table>
     <thead><tr>
       <th>When</th><th>Action</th><th>Lease ID</th><th>Pod</th>
-      <th>Token</th><th>Source IP</th><th>Duration</th><th>Profile</th>
+      <th>Token</th><th>Source IP</th><th>Duration</th><th>Sites</th><th>Profile</th>
     </tr></thead><tbody>${rows}</tbody></table>
-    <div class="empty">showing ${entries.length} of ${log.total_in_file} total entries</div>`;
+    <div class="empty">showing ${entries.length} of ${log.total_in_file} total entries · hover Sites for full URLs</div>`;
 }
 
 function renderSettings(s) {
@@ -961,13 +1002,14 @@ def _reaper() -> None:
                     _state[pod] = None
                     expired.append((pod, st))
         for pod, st in expired:
+            tabs = _sidecar_tabs(pod)               # before wipe
             _kill_quick_tunnel(st)
             _wipe_pod_profile(pod)
             duration = int((_now() - st["leased_at"]).total_seconds()) if st.get("leased_at") else None
             _audit("expire", lease_id=st["lease_id"], pod=pod,
                    quota_key=st.get("quota_key", "anonymous"),
                    source_ip=st.get("source_ip", "unknown"),
-                   duration_s=duration)
+                   duration_s=duration, tabs=tabs)
 
 
 threading.Thread(target=_reaper, daemon=True, name="reaper").start()

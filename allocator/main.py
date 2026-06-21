@@ -836,6 +836,13 @@ _ADMIN_HTML = """<!doctype html>
     a:hover{text-decoration:underline}
     .empty{color:var(--muted);padding:24px;text-align:center}
     .pill{padding:1px 6px;background:var(--bg3);border-radius:3px;font-family:var(--mono);font-size:11px}
+    /* keep long site lists from blowing out the table width */
+    td.sites{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}
+    .subtabs{display:flex;gap:6px;margin-bottom:12px}
+    .subtabs button{background:var(--bg3);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:5px 12px;cursor:pointer;font:inherit;font-size:12px}
+    .subtabs button.active{color:var(--fg);border-color:var(--fg)}
+    .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+    .status-dot.active{background:var(--green)} .status-dot.released{background:var(--muted)} .status-dot.expired{background:var(--red)}
   </style>
 </head>
 <body>
@@ -853,6 +860,7 @@ _ADMIN_HTML = """<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 let cur = 'live';
+let allView = 'grouped';   // All Sessions sub-view: grouped-by-session | flat
 const fmtAge = s => {
   if (s == null) return '—';
   if (s < 60) return s + 's';
@@ -919,9 +927,61 @@ function renderLive(s) {
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function renderAll(log) {
+function setAllView(v){ allView = v; refresh(); }
+function subtabsBar(){
+  return `<div class="subtabs">
+    <button class="${allView==='grouped'?'active':''}" onclick="setAllView('grouped')">Grouped by session</button>
+    <button class="${allView==='flat'?'active':''}" onclick="setAllView('flat')">Flat log</button>
+  </div>`;
+}
+const sitesCell = tabs => `<td class="sites" title="${(tabs||[]).flatMap(t=>[t.url,...(t.history||[])]).filter(Boolean).join('\\n')}">${sitesSummary(tabs)}</td>`;
+
+function renderAll(log){ return allView === 'flat' ? renderFlat(log) : renderGrouped(log); }
+
+// One row per lease_id: collapse acquire + release/expire into a single
+// session line. Concurrent sessions no longer interleave. Rejected acquires
+// (no lease_id) are summarised at the bottom.
+function renderGrouped(log) {
   const entries = log.entries || [];
-  if (!entries.length) return '<div class="empty">no audit entries yet</div>';
+  if (!entries.length) return subtabsBar() + '<div class="empty">no audit entries yet</div>';
+  const groups = new Map();
+  let rejects = 0;
+  for (const e of entries) {
+    if (!e.lease_id) { if ((e.action||'').startsWith('exhausted')) rejects++; continue; }
+    if (!groups.has(e.lease_id)) groups.set(e.lease_id, {});
+    const g = groups.get(e.lease_id);
+    if (e.action === 'acquire') g.acquire = e;
+    else if (e.action === 'release' || e.action === 'expire') g.end = e;
+    g.last = e;
+  }
+  const rows = [...groups.entries()].map(([lid, g]) => {
+    const a = g.acquire || g.last, end = g.end;
+    const status = end ? (end.action === 'expire' ? 'expired' : 'released') : 'active';
+    const dur = end ? end.duration_s : Math.floor((Date.now() - Date.parse(a.ts))/1000);
+    return { lid, a, end, status, startTs: a.ts, dur, tabs: end ? end.tabs : null };
+  }).sort((x,y) => Date.parse(y.startTs) - Date.parse(x.startTs));
+  const trs = rows.map(r => `<tr>
+    <td><span class="status-dot ${r.status}"></span>${r.status}</td>
+    <td class="mono">${fmtDate(r.startTs)}</td>
+    <td class="mono">${short(r.lid)}</td>
+    <td class="mono">${r.a.pod || '—'}</td>
+    <td class="mono"><span class="pill">${tail10(r.a.quota_key)}</span></td>
+    <td class="mono">${r.a.source_ip || '—'}</td>
+    <td class="mono">${r.dur != null ? fmtAge(r.dur) : '—'}</td>
+    ${sitesCell(r.tabs)}
+    <td>${r.a.profile || (r.end && r.end.save_as) || '—'}</td>
+  </tr>`).join('');
+  const rej = rejects ? `<div class="empty">+ ${rejects} rejected acquire attempt(s) (quota / pool full) in this window</div>` : '';
+  return subtabsBar() + `<table><thead><tr>
+      <th>Status</th><th>Started</th><th>Lease</th><th>Pod</th><th>Token</th>
+      <th>Source IP</th><th>Duration</th><th>Sites</th><th>Profile</th>
+    </tr></thead><tbody>${trs}</tbody></table>
+    <div class="empty">${rows.length} session(s) · grouped by lease · hover Sites for full URLs</div>${rej}`;
+}
+
+function renderFlat(log) {
+  const entries = log.entries || [];
+  if (!entries.length) return subtabsBar() + '<div class="empty">no audit entries yet</div>';
   const rows = entries.map(e => `<tr>
     <td class="mono">${fmtDate(e.ts)}</td>
     <td><span class="badge ${e.action.split('_')[0]}">${e.action}</span></td>
@@ -930,10 +990,10 @@ function renderAll(log) {
     <td class="mono"><span class="pill">${tail10(e.quota_key)}</span></td>
     <td class="mono">${e.source_ip || '—'}</td>
     <td class="mono">${e.duration_s != null ? fmtAge(e.duration_s) : '—'}</td>
-    <td title="${(e.tabs||[]).flatMap(t=>[t.url,...(t.history||[])]).filter(Boolean).join('\\n')}">${sitesSummary(e.tabs)}</td>
+    ${sitesCell(e.tabs)}
     <td>${e.profile || e.save_as || '—'}</td>
   </tr>`).join('');
-  return `<table>
+  return subtabsBar() + `<table>
     <thead><tr>
       <th>When</th><th>Action</th><th>Lease ID</th><th>Pod</th>
       <th>Token</th><th>Source IP</th><th>Duration</th><th>Sites</th><th>Profile</th>

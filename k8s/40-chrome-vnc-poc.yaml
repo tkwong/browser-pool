@@ -210,7 +210,13 @@ spec:
               # didn't shut down correctly / Restore pages?" infobar in the noVNC
               # view. RestoreOnStartup=5 only stops tab-restore, NOT the bubble —
               # these flags suppress the bubble itself (2026-07-18).
-              value: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble"
+              # --enable-unsafe-swiftshader + --use-angle=swiftshader: the pod has
+              # NO GPU (Xvfb, no passthrough), and Chrome 120+ disabled the
+              # automatic SwiftShader software-WebGL fallback for security. Without
+              # these, getContext('webgl') returns null → "no WebGL context", a
+              # strong headless/VM tell that Akamai (Xero login) blocks on. These
+              # re-enable software WebGL so a renderer string is present (2026-07-18).
+              value: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader"
           ports:
             - { name: novnc, containerPort: 3000 }
           resources:

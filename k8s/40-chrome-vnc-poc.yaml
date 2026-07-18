@@ -204,7 +204,13 @@ spec:
               # --remote-allow-origins=* bypasses the post-2023 Chromium CDP
               # Host-header anti-DNS-rebinding check; needed because requests
               # going through socat will have non-localhost Host headers.
-              value: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run --no-default-browser-check"
+              # --hide-crash-restore-bubble + --disable-session-crashed-bubble:
+              # kubelet SIGKILLs Chromium (never a clean exit), so the profile's
+              # exit_type stays "Crashed" and the next start pops the "Chromium
+              # didn't shut down correctly / Restore pages?" infobar in the noVNC
+              # view. RestoreOnStartup=5 only stops tab-restore, NOT the bubble —
+              # these flags suppress the bubble itself (2026-07-18).
+              value: "--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble"
           ports:
             - { name: novnc, containerPort: 3000 }
           resources:

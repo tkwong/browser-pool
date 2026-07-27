@@ -409,6 +409,19 @@ class ReleaseReq(BaseModel):
 # --------------------------------------------------------------------------- #
 # Routes                                                                      #
 # --------------------------------------------------------------------------- #
+def _cdp_healthy(pod: str) -> bool:
+    """Ping the pod's in-cluster CDP relay before leasing it. Chromium can wedge
+    or OOM-crash-loop while _state still shows the pod 'free'; the allocator
+    would otherwise hand it out by name and the agent's connectOverCDP gets a
+    502. A dead relay returns 502 fast; only an unreachable pod hits the timeout.
+    Unhealthy pods are left in the free pool for the liveness probe to recycle."""
+    try:
+        r = httpx.get(f"{POD_INTERNAL_URL_TPL.format(pod=pod)}/json/version", timeout=2.0)
+        return r.status_code == 200
+    except Exception:                                                    # noqa: BLE001
+        return False
+
+
 @app.post("/acquire", response_model=AcquireResp)
 def acquire(
     req: AcquireReq,
@@ -449,6 +462,9 @@ def acquire(
                 )
         for pod in POOL:
             if _state[pod] is None:
+                if not _cdp_healthy(pod):
+                    log.warning("acquire: skip pod=%s — CDP unhealthy (wedged/OOM); leaving for liveness probe to recycle", pod)
+                    continue
                 claimed_pod = pod
                 _state[pod] = {
                     "lease_id": lease_id,

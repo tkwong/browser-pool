@@ -221,7 +221,7 @@ spec:
             - { name: novnc, containerPort: 3000 }
           resources:
             requests: { memory: "512Mi", cpu: "300m" }
-            limits:   { memory: "2Gi",   cpu: "2000m" }
+            limits:   { memory: "3Gi",   cpu: "2000m" }   # 2Gi OOM-crash-looped the hot pods (0/1) 2026-07-27; 3Gi headroom, still safe over-commit on the 16GB VM at low concurrency
           # /dev/shm must be larger than the default 64MiB or Chromium tab
           # rendering crashes randomly.
           volumeMounts:

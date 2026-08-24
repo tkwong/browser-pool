@@ -561,6 +561,52 @@ async function injectProfile(profile) {
   } finally { browser.close() }
 }
 
+// --- VIEWERS (is a human watching?) --- //
+// The pool's noVNC/KasmVNC viewer is served straight off these container ports;
+// a human with the tab open holds a long-lived websocket to one of them. That is
+// the ONLY signal the pod has that a person — not just an agent — is driving, and
+// it is what stops a release from yanking the browser mid-login.
+//
+// The kubelet's `tcpSocket: 3000` readiness probe also connects here, so a single
+// snapshot of /proc/net/tcp would false-positive on a probe that is about to
+// close. We therefore sample twice and keep only the sockets that survive both:
+// a probe lasts microseconds, a viewer lasts minutes.
+const VIEWER_PORTS = new Set(
+  (process.env.VIEWER_PORTS || '3000,3001')
+    .split(',').map(x => parseInt(x.trim(), 10)).filter(Number.isFinite)
+)
+const VIEWER_SAMPLE_GAP_MS = parseInt(process.env.VIEWER_SAMPLE_GAP_MS || '700', 10)
+const TCP_ESTABLISHED = '01'
+
+async function sampleViewerSockets() {
+  const found = new Set()
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let txt
+    try { txt = await fs.readFile(f, 'utf8') } catch { continue }
+    for (const line of txt.split('\n').slice(1)) {
+      const c = line.trim().split(/\s+/)
+      if (c.length < 4 || c[3] !== TCP_ESTABLISHED) continue
+      const local = c[1], remote = c[2]
+      const lport = parseInt(local.slice(local.lastIndexOf(':') + 1), 16)
+      if (!VIEWER_PORTS.has(lport)) continue
+      found.add(`${local}->${remote}`)
+    }
+  }
+  return found
+}
+
+// Returns { viewers, sockets, ports }. `viewers` is a count of durable viewer
+// connections; 0 means nobody is looking and a release is safe.
+async function viewers() {
+  const t0 = Date.now()
+  const a = await sampleViewerSockets()
+  if (!a.size) return { viewers: 0, sockets: [], ports: [...VIEWER_PORTS], sampled_ms: Date.now() - t0 }
+  await new Promise(r => setTimeout(r, VIEWER_SAMPLE_GAP_MS))
+  const b = await sampleViewerSockets()
+  const durable = [...a].filter(k => b.has(k))
+  return { viewers: durable.length, sockets: durable, ports: [...VIEWER_PORTS], sampled_ms: Date.now() - t0 }
+}
+
 // --- STATUS --- //
 async function status() {
   const alive = await chromiumAlive()
@@ -576,7 +622,9 @@ async function status() {
       targetCount = targets.filter(t => t.type === 'page').length
     } catch {}
   }
-  return { chromium_alive: alive, cookie_count: cookieCount, target_count: targetCount, last_wipe_at: lastWipe }
+  const v = await viewers()
+  return { chromium_alive: alive, cookie_count: cookieCount, target_count: targetCount,
+           viewer_clients: v.viewers, last_wipe_at: lastWipe }
 }
 
 // --- TABS (browsing history) --- //
@@ -832,6 +880,7 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && url.pathname === '/snapshot')   res.end(JSON.stringify(await snapshotProfile(await readBody(req))))
     else if (req.method === 'POST' && url.pathname === '/restore')    res.end(JSON.stringify(await restoreProfile(await readBody(req))))
     else if (req.method === 'GET' && url.pathname === '/tabs')          res.end(JSON.stringify(await tabs()))
+    else if (req.method === 'GET' && url.pathname === '/viewers')      res.end(JSON.stringify(await viewers()))
     else if (req.method === 'GET' && url.pathname === '/status')       res.end(JSON.stringify(await status()))
     else if (req.method === 'GET' && url.pathname === '/healthz')      res.end(JSON.stringify({ ok: true }))
     else { res.statusCode = 404; res.end(JSON.stringify({ error: 'not_found' })) }

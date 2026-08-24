@@ -188,30 +188,74 @@ if matching:
 
 # --------------------------------------------------------------------------- #
 # 5. Per-token rate limit (429 token_quota_exceeded)                           #
-# When MAX_LEASES_PER_TOKEN=1 (prod default), a single token can hold 1 lease  #
-# at a time. The 2nd concurrent acquire from same token = 429 BEFORE pool      #
-# exhaustion. Pool exhaustion (423) requires multi-token traffic — not covered #
-# by single-token smoke.                                                       #
+# A single token may hold MAX_LEASES_PER_TOKEN leases at once; the acquire that #
+# crosses the cap is a 429 BEFORE pool exhaustion. The cap is a deployment knob #
+# (was 1, has been 3 since 2026-06-21), so acquire until the server says stop   #
+# rather than hard-coding it. Pool exhaustion (423) needs multi-token traffic — #
+# not covered by single-token smoke, and treated here as "can't test".          #
 # --------------------------------------------------------------------------- #
 step("per-token rate limit (429 token_quota_exceeded)")
-r1 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
-check("first acquire 200", r1.status_code == 200, str(r1.status_code))
-r2 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
-check("second acquire 429", r2.status_code == 429, str(r2.status_code))
-check("Retry-After header present on 429",
-      "retry-after" in {k.lower() for k in r2.headers})
-if r2.status_code == 429:
-    err = r2.json()
+held, capped, exhausted = [], None, False
+for _ in range(8):
+    r = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
+    if r.status_code == 200:
+        held.append(r.json()["lease_id"])
+        continue
+    if r.status_code == 429:
+        capped = r
+    else:
+        exhausted = True          # 423 pool_exhausted, or anything unexpected
+    break
+
+check("first acquire 200", bool(held), "no lease granted")
+if exhausted:
+    print("  SKIP  quota cap not reachable — pool busy with other tokens")
+else:
+    check("acquire past the cap = 429", capped is not None,
+          f"{len(held)} leases granted without a 429")
+if capped is not None:
+    check("Retry-After header present on 429",
+          "retry-after" in {k.lower() for k in capped.headers})
+    err = capped.json()
     check("error=token_quota_exceeded", err.get("error") == "token_quota_exceeded")
     check("max_leases_per_token reported", isinstance(err.get("max_leases_per_token"), int))
+    check("cap matches leases actually held", err.get("max_leases_per_token") == len(held),
+          f"reported {err.get('max_leases_per_token')}, held {len(held)}")
 
-# Release the first → 2nd attempt should now succeed
-if r1.status_code == 200:
-    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": r1.json()["lease_id"]})
+# Release one → the next attempt should fit under the cap again
+if held:
+    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": held.pop()})
 r3 = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
 check("after release, fresh acquire 200", r3.status_code == 200, str(r3.status_code))
 if r3.status_code == 200:
-    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": r3.json()["lease_id"]})
+    held.append(r3.json()["lease_id"])
+for lid in held:
+    CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": lid})
+
+
+# --------------------------------------------------------------------------- #
+# 5b. Viewer guard preflight (GET /viewers/{lease_id})                         #
+# Only the "nobody is watching" half is testable from a REST client — proving  #
+# the positive case needs a real noVNC socket, which lives in make integration.#
+# --------------------------------------------------------------------------- #
+step("viewer guard preflight")
+rv = CLIENT.post(f"{ALLOCATOR}/acquire", json={"ttl": 60})
+check("acquire 200", rv.status_code == 200, str(rv.status_code))
+if rv.status_code == 200:
+    lid = rv.json()["lease_id"]
+    v = CLIENT.get(f"{ALLOCATOR}/viewers/{lid}")
+    check("GET /viewers/{lease_id} 200", v.status_code == 200, str(v.status_code))
+    if v.status_code == 200:
+        vj = v.json()
+        check("viewers is an int", isinstance(vj.get("viewers"), int), str(vj))
+        check("no viewer on a fresh lease", vj.get("viewers") == 0, str(vj.get("viewers")))
+        check("pod reported", bool(vj.get("pod")))
+    # An unguarded release must still work when nobody is watching.
+    rr = CLIENT.post(f"{ALLOCATOR}/release", json={"lease_id": lid})
+    check("release 200 with no viewer", rr.status_code == 200, str(rr.status_code))
+    check("saved_format absent when not saving", rr.json().get("saved_format") is None)
+    check("/viewers on a released lease = 404",
+          CLIENT.get(f"{ALLOCATOR}/viewers/{lid}").status_code == 404)
 
 
 # --------------------------------------------------------------------------- #

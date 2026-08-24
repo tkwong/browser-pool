@@ -41,9 +41,37 @@ Never put it in agent-facing config, `cdp_url`, or docs.
 `k8s/20-allocator.yaml` → `CDP_URL_CHROME_VNC_{0,1}` are the published CF Tunnel
 hostnames. That file is authoritative; the rendered artifact is derived.
 
+## Never yank a session a human is in
+
+`/release` wipes the pod's profile and kills the viewer tunnel. Doing that while
+the operator is mid-login destroys their work (the 2026-08-24 incident: a login
+finished, then the agent released and the session vanished).
+
+The sidecar's `GET /viewers` counts durable ESTABLISHED sockets on the noVNC
+ports (3000/3001) — it samples twice, so the kubelet's `tcpSocket: 3000`
+readiness probe can't false-positive. The allocator refuses `/release` with
+**409 `viewer_attached`** when that count is > 0, and exposes
+`GET /viewers/{lease_id}` so a client can preflight *before* it closes its own
+browser handle. `force: true` overrides; `viewers: -1` means unknown and never
+blocks, so a sidecar outage can't strand a lease. The TTL reaper does not go
+through `/release`, so the hard backstop is unaffected.
+
+Note the tail: after the human closes the tab, cloudflared holds origin
+keep-alives for up to ~90s (measured: 4 sockets at +8s, 0 by ~+80s), so the
+count decays rather than dropping instantly. The MCP client waits that out
+(`RELEASE_VIEWER_WAIT_MS`, default 45s) on an explicit release. Socket presence
+is deliberately the conservative signal — a false "someone is watching" only
+delays a release; a false "nobody is watching" destroys a login.
+
 ## Tests
 
 - `make smoke` — fast, allocator **REST surface only** (no CDP). **Green smoke does
   NOT prove CDP is reachable** — that gap is exactly what hid the Tailscale bug.
 - `make integration` — Playwright; actually connects CDP + navigates. This is the
   one that catches the "operator-only Tailscale URL" reach failure.
+- Smoke needs `httpx`, which is not in the system python3: run it as
+  `BROWSER_POOL_URL=https://allocator.cartforge.net uv run --with httpx python tests/smoke.py`.
+- Smoke only covers the "nobody is watching" half of the viewer guard. The
+  positive case needs a real noVNC socket — hold one from inside the pod
+  (`node -e "require('net').connect(3000,'127.0.0.1')"`) or open the lease's
+  `view_url` in a browser, then assert `/release` returns 409.

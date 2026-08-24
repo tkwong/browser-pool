@@ -447,6 +447,7 @@ class ReleaseReq(BaseModel):
     save_as: Optional[str] = Field(default=None, description="Save the pod's profile as /profiles/<name>.tar.gz before wiping — cookies + localStorage + IndexedDB. Supersedes any same-named legacy .json.")
     save_domain_filter: Optional[str] = Field(default=None, description="Limit save_as to cookies whose domain contains this substring (e.g. 'facebook.com'). Forces the legacy JSON format, which cannot carry IndexedDB.")
     save_service_worker: bool = Field(default=False, description="Include the Service Worker cache in the saved tarball (+15MB). Off by default: a stale registration alongside fresh IndexedDB tends to confuse sites more than it helps.")
+    force: bool = Field(default=False, description="Release even if a human currently has the pod's noVNC viewer open. Off by default: releasing wipes the profile and kills the viewer tunnel, which destroys a login the operator is in the middle of.")
 
 
 # --------------------------------------------------------------------------- #
@@ -613,6 +614,26 @@ def release(
 ):
     _check_auth(authorization)
     rel_quota_key, rel_source_ip = _caller_identity(cf_jwt, cf_access_client_id, x_forwarded_for, cf_connecting_ip)
+
+    # Viewer guard. Release wipes the profile and kills the quick tunnel, so
+    # doing it while the operator is mid-login destroys their work — that is the
+    # 2026-08-24 buyee incident. Checked BEFORE the lease is popped so a refusal
+    # leaves the lease intact. The TTL reaper does not come through here, so the
+    # hard backstop is unaffected; -1 (unknown) never blocks.
+    if not req.force:
+        with _lock:
+            peek_pod = _lease_to_pod.get(req.lease_id)
+        if peek_pod:
+            n_viewers = _sidecar_viewers(peek_pod)
+            if n_viewers > 0:
+                log.info("release refused pod=%s lease=%s viewers=%d", peek_pod, req.lease_id, n_viewers)
+                raise HTTPException(status_code=409, detail={
+                    "error": "viewer_attached",
+                    "pod": peek_pod,
+                    "viewers": n_viewers,
+                    "hint": "a human has the noVNC viewer open — wait for them, or retry with force=true",
+                })
+
     with _lock:
         pod = _lease_to_pod.pop(req.lease_id, None)
         if not pod:
@@ -621,6 +642,7 @@ def release(
         _state[pod] = None
 
     saved_to: Optional[str] = None
+    saved_format: Optional[str] = None
     # Order: save_as BEFORE wipe (else there's nothing to dump).
     if req.save_as:
         if not _profiles_enabled():
@@ -635,6 +657,7 @@ def release(
                     path = _profile_path(req.save_as)
                     path.write_text(json.dumps(profile, indent=2))
                     saved_to = str(path)
+                    saved_format = "json"   # narrower: no IndexedDB
                     log.info("saved profile=%s pod=%s format=json cookies=%d origins=%d → %s",
                              req.save_as, pod, len(profile.get("cookies", [])),
                              len(profile.get("origins", [])), path)
@@ -643,6 +666,7 @@ def release(
                     path = _profile_tar_path(req.save_as)
                     path.write_bytes(blob)
                     saved_to = str(path)
+                    saved_format = "tar"
                     # Drop a stale JSON of the same name so acquire's
                     # tar-then-json fallback can never serve the older, thinner
                     # copy if the tarball is later removed by hand.
@@ -670,9 +694,35 @@ def release(
            quota_key=(rel_quota_key if rel_quota_key != "anonymous"
                       else (old_state or {}).get("quota_key", "anonymous")),
            source_ip=rel_source_ip,
-           save_as=req.save_as, duration_s=duration, tabs=tabs)
+           save_as=req.save_as, duration_s=duration, tabs=tabs,
+           forced=req.force or None)
     log.info("released pod=%s lease=%s save_as=%s", pod, req.lease_id, req.save_as or "(none)")
-    return {"released": True, "pod": pod, "saved_to": saved_to}
+    # saved_format is returned so a caller can see it got the thin JSON dump
+    # (save_domain_filter) instead of the full tarball, rather than finding out
+    # later when the restored profile is missing IndexedDB.
+    return {"released": True, "pod": pod, "saved_to": saved_to,
+            "saved_format": saved_format}
+
+
+@app.get("/viewers/{lease_id}")
+def viewers(
+    lease_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Is a human watching this lease's pod right now?
+
+    Preflight for clients that tear their local browser down before calling
+    /release: closing the browser first and *then* discovering the release is
+    refused would already have destroyed the operator's session. `viewers: -1`
+    means unknown — treat it as "not blocking".
+    """
+    _check_auth(authorization)
+    with _lock:
+        pod = _lease_to_pod.get(lease_id)
+    if not pod:
+        raise HTTPException(status_code=404, detail="lease_not_found")
+    n = _sidecar_viewers(pod)
+    return {"lease_id": lease_id, "pod": pod, "viewers": n, "known": n >= 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -818,6 +868,28 @@ def _sidecar_status(pod: str) -> dict[str, Any]:
             return r.json()
     except Exception:                                                 # noqa: BLE001
         return {}
+
+
+def _sidecar_viewers(pod: str) -> int:
+    """How many humans have the pod's noVNC viewer open right now.
+
+    The sidecar counts durable ESTABLISHED sockets on the viewer ports (it
+    samples twice so the kubelet's tcpSocket probe can't false-positive).
+    Returns -1 when the answer is unknown — an old sidecar without /viewers, or
+    an unreachable one. Callers must treat -1 as "don't block", so a sidecar
+    outage can never strand a lease.
+    """
+    if not CONTROL_URL_TPL:
+        return -1
+    url = f"{CONTROL_URL_TPL.format(pod=pod)}/viewers"
+    try:
+        with httpx.Client(timeout=4.0) as c:
+            r = c.get(url)
+            if r.status_code != 200:
+                return -1
+            return int(r.json().get("viewers", -1))
+    except Exception:                                                 # noqa: BLE001
+        return -1
 
 
 def _sidecar_tabs(pod: str) -> list[dict]:

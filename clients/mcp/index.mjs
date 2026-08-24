@@ -128,16 +128,36 @@ async function allocatorRelease(leaseId, opts = {}) {
   const body = { lease_id: leaseId };
   if (opts.save_as) body.save_as = opts.save_as;
   if (opts.save_domain_filter) body.save_domain_filter = opts.save_domain_filter;
+  if (opts.force) body.force = true;
   try {
     const r = await fetch(`${ALLOCATOR}/release`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...CF_HEADERS },
       body: JSON.stringify(body),
     });
-    return await r.json().catch(() => ({}));
+    const j = await r.json().catch(() => ({}));
+    // 409 = the allocator refused because a human has the viewer open.
+    if (r.status === 409) return { refused: j?.detail ?? { error: "viewer_attached" } };
+    return j;
   } catch (e) {
     log(`release of ${leaseId} failed: ${e.message}`);
     return {};
+  }
+}
+
+// Is a human watching this lease's pod? Returns a count, or -1 when unknown
+// (old/unreachable allocator) — callers must treat -1 as "not blocking" so a
+// allocator hiccup can never wedge the client into never releasing.
+async function allocatorViewers(leaseId) {
+  try {
+    const r = await fetch(`${ALLOCATOR}/viewers/${encodeURIComponent(leaseId)}`, {
+      headers: { ...CF_HEADERS },
+    });
+    if (!r.ok) return -1;
+    const j = await r.json().catch(() => ({}));
+    return Number.isFinite(j?.viewers) ? j.viewers : -1;
+  } catch {
+    return -1;
   }
 }
 
@@ -180,9 +200,51 @@ async function ensureBrowser() {
   page = context.pages()[0] || (await context.newPage());
 }
 
+// Refuse to tear down a session a human is in the middle of. Two independent
+// signals, because either alone has a blind spot: help mode only fires if the
+// agent actually called browser_request_user_help, and the viewer count only
+// works if the allocator/sidecar are new enough to report it.
+//
+// Checked BEFORE browser.close() on purpose — closing first and asking after
+// would already have destroyed the operator's login by the time we found out.
+// After a human closes the viewer tab, cloudflared holds its origin
+// connections open on a keep-alive for up to ~90s (measured 2026/08/24: 4
+// sockets at +8s, 0 by ~+80s). Socket presence is deliberately the conservative
+// signal — a false "someone is watching" only delays a release, while a false
+// "nobody is watching" destroys a live login — so an explicit release waits out
+// that tail instead of failing the call.
+const RELEASE_VIEWER_WAIT_MS = parseInt(process.env.RELEASE_VIEWER_WAIT_MS || "45000", 10);
+const VIEWER_POLL_MS = 5_000;
+
+async function teardownBlockedBy(reason, opts) {
+  if (opts.force) return null;
+  if (isHelpModeActive()) {
+    return { error: "help_mode_active", help_ids: Object.keys(helpFlags),
+             hint: "a browser_request_user_help session is still open — call browser_wait_for_user_done first, or pass force:true" };
+  }
+  // Only a caller-driven release waits; the idle reaper returns immediately and
+  // retries on its own schedule rather than holding the event loop.
+  const deadline = Date.now() + (opts.waitForViewers ? RELEASE_VIEWER_WAIT_MS : 0);
+  let n = await allocatorViewers(lease.lease_id);
+  while (n > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, VIEWER_POLL_MS));
+    n = await allocatorViewers(lease.lease_id);
+  }
+  if (n > 0) {
+    return { error: "viewer_attached", viewers: n,
+             hint: "a human has the noVNC viewer open — wait for them and retry, or pass force:true" };
+  }
+  return null;
+}
+
 async function teardown(reason, opts = {}) {
   if (!lease) return;
   const id = lease.lease_id;
+  const blocked = await teardownBlockedBy(reason, opts);
+  if (blocked) {
+    log(`release (${reason}) lease=${id} REFUSED: ${blocked.error}`);
+    return { ...lease, refused: blocked };
+  }
   log(`release (${reason}) lease=${id}` + (opts.save_as ? ` save_as=${opts.save_as}` : ""));
   try {
     await browser?.close();
@@ -192,15 +254,29 @@ async function teardown(reason, opts = {}) {
   lease = null;
   helpFlags = {};
   const releaseResult = await allocatorRelease(id, opts);
+  if (releaseResult?.refused) {
+    // Server said no after we had already closed our CDP handle. Chromium is
+    // relaunched by the pod watchdog; put the lease back so we retry later
+    // rather than orphaning it.
+    lease = oldLease;
+    log(`release (${reason}) lease=${id} REFUSED by allocator: ${releaseResult.refused.error}`);
+    return { ...oldLease, refused: releaseResult.refused };
+  }
   return { ...oldLease, release_result: releaseResult };
 }
 
-// Idle reaper.
+// Idle reaper. Never forces: an idle agent is exactly the case where a human
+// is quietly logging in through the viewer, so a refusal means wait, not push.
+let idleRetryAfterMs = 0;
+const IDLE_REFUSAL_BACKOFF_MS = 60_000;
 const reaper = setInterval(async () => {
   if (!lease) return;
   if (isHelpModeActive()) return; // user is in the middle of helping — don't yank
+  if (Date.now() < idleRetryAfterMs) return;
   if (Date.now() - lastActivityMs > IDLE_RELEASE_MS) {
-    await teardown("idle");
+    const r = await teardown("idle");
+    // Lease is kept on refusal; try again later instead of every IDLE_CHECK_MS.
+    if (r?.refused) idleRetryAfterMs = Date.now() + IDLE_REFUSAL_BACKOFF_MS;
   }
 }, IDLE_CHECK_MS);
 reaper.unref();
@@ -360,7 +436,7 @@ const TOOLS = [
   },
   {
     name: "browser_get_session_info",
-    description: "Return { active, lease_id, view_url, cdp_url, pod, current_url, idle_seconds, help_mode }.",
+    description: "Return { active, lease_id, view_url, cdp_url, pod, current_url, idle_seconds, help_mode, viewers }. `viewers` > 0 means a human has the noVNC viewer open right now (-1 = unknown) — check it before releasing.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -410,18 +486,19 @@ const TOOLS = [
   },
   {
     name: "browser_release",
-    description: "Explicitly release the current lease (browser closed, pod returned to the pool). Next browser_* call will lazy-acquire again. Optionally dump cookies+storage to a named profile BEFORE the wipe.",
+    description: "Explicitly release the current lease (browser closed, pod returned to the pool). Next browser_* call will lazy-acquire again. Optionally dump the profile to a named store BEFORE the wipe. REFUSED (ok:false) while a human has the noVNC viewer open or a browser_request_user_help session is unfinished — releasing wipes the profile and kills the viewer, so it would destroy a login in progress. Wait for them, or pass force:true if you are certain nobody is using it.",
     inputSchema: {
       type: "object",
       properties: {
-        save_as: { type: "string", description: "Save this lease's state as a named profile before releasing (allocator-side persistent store). Skipped on auto-release." },
-        save_domain_filter: { type: "string", description: "Only save cookies whose domain contains this substring (e.g. 'facebook.com')." },
+        save_as: { type: "string", description: "Save this lease's state as a named profile before releasing (allocator-side persistent store). Skipped on auto-release. Saves the FULL profile tarball — cookies + localStorage + IndexedDB — unless save_domain_filter is also set." },
+        save_domain_filter: { type: "string", description: "Only save cookies whose domain contains this substring (e.g. 'facebook.com'). WARNING: this downgrades the save to the thin JSON format (cookies + localStorage ONLY) — IndexedDB is NOT captured, so sites that keep their session there come back logged out. Omit it unless you specifically need to scope the dump to one domain." },
+        force: { type: "boolean", default: false, description: "Release even if a human currently has the viewer open / a help session unfinished. Destroys their in-progress session — only pass it when you know they are done." },
       },
     },
   },
   {
     name: "browser_load_profile",
-    description: "Acquire a fresh lease with a named profile injected (cookies + localStorage from allocator's profile store). If a lease is already active, it is released first. Use this when you need the agent to start out logged-in to a specific account.",
+    description: "Acquire a fresh lease with a named profile injected (full profile from the allocator's store: cookies + localStorage + IndexedDB for tarball profiles, cookies + localStorage only for legacy JSON ones). If a lease is already active it is released first — which fails if a human is currently using it. Use this when you need the agent to start out logged-in to a specific account.",
     inputSchema: {
       type: "object",
       properties: {
@@ -642,6 +719,8 @@ async function handleTool(name, args) {
         idle_release_seconds: Math.round(IDLE_RELEASE_MS / 1000),
         help_mode: isHelpModeActive(),
         active_help_ids: Object.keys(helpFlags),
+        // >0 means a human has the noVNC viewer open right now; -1 = unknown.
+        viewers: lease ? await allocatorViewers(lease.lease_id) : 0,
       };
     }
 
@@ -690,11 +769,23 @@ async function handleTool(name, args) {
       const released = await teardown("explicit", {
         save_as: args?.save_as,
         save_domain_filter: args?.save_domain_filter,
+        force: args?.force === true,
+        waitForViewers: true,
       });
+      if (released?.refused) {
+        return {
+          ok: false,
+          released: false,
+          lease_id: released.lease_id,
+          view_url: released.view_url,
+          ...released.refused,
+        };
+      }
       return {
         ok: true,
         released_lease_id: released?.lease_id,
         saved_to: released?.release_result?.saved_to || null,
+        saved_format: released?.release_result?.saved_format || null,
       };
     }
 
@@ -702,7 +793,13 @@ async function handleTool(name, args) {
       if (!args?.name) throw new Error("name required");
       if (lease) {
         log(`browser_load_profile: tearing down existing lease to switch profile`);
-        await teardown("switch-profile");
+        const r = await teardown("switch-profile", { waitForViewers: true });
+        if (r?.refused) {
+          throw new Error(
+            `cannot switch profile: ${r.refused.error} — ${r.refused.hint}. ` +
+            `Release explicitly with force:true if you really mean to discard that session.`
+          );
+        }
       }
       pendingProfile = args.name;
       await ensureBrowser();

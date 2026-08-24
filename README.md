@@ -49,7 +49,7 @@ to live-watch and click into the browser without auth friction.
 | Human takeover | per-lease magic-link Quick Tunnel (`https://random.trycloudflare.com`) to a Selkies WebRTC viewer; real X11 events bypass CDP synthetic detection |
 | Sticky named profiles | `/acquire {profile: name}` injects cookies + localStorage; `/release {save_as: name}` dumps back to allocator-side PVC |
 | Friend-share safe | every release wipes via sidecar CDP (`Storage.clearCookies`, per-origin `Storage.clearDataForOrigin`, close non-blank tabs) — next leaseholder gets a clean Chromium |
-| Per-token rate limit | `MAX_LEASES_PER_TOKEN=1` keyed off `CF-Access-Client-Id` — one looping agent can't starve the others |
+| Per-token rate limit | `MAX_LEASES_PER_TOKEN=3` keyed off `CF-Access-Client-Id` — one looping agent can't starve the others |
 | Magic-link dies on release | `cloudflared` subprocess killed → random subdomain instantly stops resolving |
 
 ## Two audiences

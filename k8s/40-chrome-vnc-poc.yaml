@@ -175,6 +175,14 @@ spec:
   replicas: 6
   # podManagementPolicy: Parallel would be nicer but the field is immutable on
   # an existing StatefulSet. Sticking with OrderedReady (default).
+  #
+  # Staging knob. OrderedReady updates from the HIGHEST ordinal down, so
+  # `partition: N` means "only chrome-vnc-N and above". Set it to 5 to canary a
+  # risky pod-spec change on one pod (chrome-vnc-5), verify, then put it back to
+  # 0 to roll the rest. Committed at 0 = normal full rollout.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { partition: 0 }
   selector: { matchLabels: { app: chrome-vnc } }
   template:
     metadata: { labels: { app: chrome-vnc } }
@@ -227,6 +235,13 @@ spec:
           volumeMounts:
             - { name: dshm,   mountPath: /dev/shm }
             - { name: config, mountPath: /config }
+            # Shared with the control sidecar so it can open a raw X11
+            # connection to Xvfb and drop the PRIMARY/SECONDARY/CLIPBOARD
+            # selection owners on wipe. CDP cannot do this: writeText() only
+            # touches CLIPBOARD, and Chrome refuses to claim PRIMARY except
+            # from genuine user input — so a released lease was leaking the
+            # previous tenant's copied text to the next one (2026-08-23).
+            - { name: x11sock, mountPath: /tmp/.X11-unix }
             # Chromium Enterprise Policy: disable PWM + autofill (prevents
             # "Save password?" prompt entirely). WebAuthn kept enabled — user
             # can still use phone-via-QR passkey when site offers it (platform
@@ -279,6 +294,7 @@ spec:
             limits:   { memory: "128Mi", cpu: "500m" }
           volumeMounts:
             - { name: control-code, mountPath: /app, readOnly: true }
+            - { name: x11sock,      mountPath: /tmp/.X11-unix }
           readinessProbe:
             httpGet: { path: /healthz, port: 9224 }
             initialDelaySeconds: 3
@@ -286,6 +302,11 @@ spec:
       volumes:
         - name: dshm
           emptyDir: { medium: Memory, sizeLimit: 1Gi }
+        # X11 unix socket dir, shared chromium <-> control. Xvfb runs with -ac
+        # (no access control) and no XAUTHORITY, so an unauthenticated client
+        # from the sidecar connects with zero setup.
+        - name: x11sock
+          emptyDir: {}
         - name: cdp-relay-conf
           configMap: { name: chrome-vnc-cdp-relay-conf }
         - name: chrome-policy

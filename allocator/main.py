@@ -68,6 +68,10 @@ CONTROL_URL_TPL = os.environ.get(
 )
 CONTROL_WIPE_TIMEOUT = int(os.environ.get("CONTROL_WIPE_TIMEOUT_SECONDS", "45"))
 CONTROL_PROFILE_TIMEOUT = int(os.environ.get("CONTROL_PROFILE_TIMEOUT_SECONDS", "60"))
+# /snapshot and /restore stop Chromium, move ~8 MB of profile, and wait for the
+# s6 watchdog to relaunch it. Measured end-to-end well under 30s, but the wait
+# for a relaunch is capped at 90s sidecar-side, so allow more than that here.
+CONTROL_SNAPSHOT_TIMEOUT = int(os.environ.get("CONTROL_SNAPSHOT_TIMEOUT_SECONDS", "150"))
 
 # Named-profile store (Phase 2). One JSON file per profile, name-validated to
 # prevent path traversal. Lives on a PVC mounted at this path so it survives
@@ -330,6 +334,23 @@ def _profile_path(name: str) -> Path:
     return PROFILES_DIR / f"{name}.json"
 
 
+def _profile_tar_path(name: str) -> Path:
+    """Full on-disk profile tarball — the format that carries IndexedDB.
+
+    Two formats coexist in the store, and `<name>` may exist as either:
+
+      <name>.tar.gz   full profile (cookies + localStorage + IndexedDB + more)
+      <name>.json     legacy CDP dump (cookies + localStorage ONLY)
+
+    Acquire prefers the tarball. The JSON format is kept because it is the only
+    one that can be domain-filtered (`save_domain_filter`) or hand-edited, and
+    because profiles saved before 2026-08-24 are all in it.
+    """
+    if not _PROFILE_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid profile name")
+    return PROFILES_DIR / f"{name}.tar.gz"
+
+
 def _profiles_enabled() -> bool:
     try:
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
@@ -353,6 +374,27 @@ def _dump_profile_from_pod(pod: str, domain_filter: Optional[str] = None) -> dic
         body["domain_filter"] = domain_filter
     with httpx.Client(timeout=CONTROL_PROFILE_TIMEOUT) as c:
         r = c.post(url, json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+def _snapshot_profile_from_pod(pod: str, include_service_worker: bool = False) -> tuple[bytes, dict]:
+    """Ask the pod's sidecar for a full-profile tarball. Returns (bytes, meta)."""
+    url = f"{CONTROL_URL_TPL.format(pod=pod)}/snapshot"
+    with httpx.Client(timeout=CONTROL_SNAPSHOT_TIMEOUT) as c:
+        r = c.post(url, json={"include_service_worker": include_service_worker})
+        r.raise_for_status()
+        data = r.json()
+    blob = base64.b64decode(data.pop("tar_b64"))
+    if not blob:
+        raise RuntimeError("sidecar returned an empty tarball")
+    return blob, data
+
+
+def _restore_profile_into_pod(pod: str, blob: bytes) -> dict:
+    url = f"{CONTROL_URL_TPL.format(pod=pod)}/restore"
+    with httpx.Client(timeout=CONTROL_SNAPSHOT_TIMEOUT) as c:
+        r = c.post(url, json={"tar_b64": base64.b64encode(blob).decode("ascii")})
         r.raise_for_status()
         return r.json()
 
@@ -386,7 +428,7 @@ def _wipe_pod_profile(pod: str) -> None:
 class AcquireReq(BaseModel):
     ttl: Optional[int] = Field(default=None, ge=10, le=MAX_TTL, description=f"seconds, default {DEFAULT_TTL}, max {MAX_TTL}")
     tier: Optional[str] = Field(default=None, description=f"browser tier, default '{DEFAULT_TIER}'. Currently advisory only — pool is homogenous.")
-    profile: Optional[str] = Field(default=None, description="Named profile to inject into the lease (cookies + localStorage). 404 if not found.")
+    profile: Optional[str] = Field(default=None, description="Named profile to load into the lease. A tarball profile (the default format) restores cookies + localStorage + IndexedDB; a legacy JSON profile restores cookies + localStorage only. 404 if not found.")
 
 
 class AcquireResp(BaseModel):
@@ -402,8 +444,9 @@ class AcquireResp(BaseModel):
 
 class ReleaseReq(BaseModel):
     lease_id: str
-    save_as: Optional[str] = Field(default=None, description="Dump the pod's cookies+storage to /profiles/<name>.json before wiping.")
-    save_domain_filter: Optional[str] = Field(default=None, description="Limit save_as to cookies whose domain contains this substring (e.g. 'facebook.com').")
+    save_as: Optional[str] = Field(default=None, description="Save the pod's profile as /profiles/<name>.tar.gz before wiping — cookies + localStorage + IndexedDB. Supersedes any same-named legacy .json.")
+    save_domain_filter: Optional[str] = Field(default=None, description="Limit save_as to cookies whose domain contains this substring (e.g. 'facebook.com'). Forces the legacy JSON format, which cannot carry IndexedDB.")
+    save_service_worker: bool = Field(default=False, description="Include the Service Worker cache in the saved tarball (+15MB). Off by default: a stale registration alongside fresh IndexedDB tends to confuse sites more than it helps.")
 
 
 # --------------------------------------------------------------------------- #
@@ -512,18 +555,34 @@ def acquire(
     if req.profile:
         if not _profiles_enabled():
             raise HTTPException(status_code=503, detail="profiles store unavailable")
-        path = _profile_path(req.profile)
-        if not path.exists():
+        # Prefer the full tarball: it is the only format carrying IndexedDB, so
+        # it is the only one that restores a WhatsApp-Web-class login. Fall back
+        # to the legacy JSON dump for profiles saved before 2026-08-24 and for
+        # domain-filtered ones, which have no tarball by construction.
+        tar_path = _profile_tar_path(req.profile)
+        json_path = _profile_path(req.profile)
+        if tar_path.exists():
+            try:
+                injected = _restore_profile_into_pod(claimed_pod, tar_path.read_bytes())
+                injected["format"] = "tar"
+                log.info("restored profile=%s (tar, %d bytes) into pod=%s result=%s",
+                         req.profile, tar_path.stat().st_size, claimed_pod, injected)
+            except Exception as e:                                    # noqa: BLE001
+                log.error("restore profile=%s pod=%s failed: %s", req.profile, claimed_pod, e)
+                raise HTTPException(status_code=502, detail=f"restore failed: {e}") from e
+        elif json_path.exists():
+            try:
+                profile = json.loads(json_path.read_text())
+                injected = _inject_profile_into_pod(claimed_pod, profile)
+                injected["format"] = "json"
+                log.info("injected profile=%s into pod=%s result=%s", req.profile, claimed_pod, injected)
+            except HTTPException:
+                raise
+            except Exception as e:                                    # noqa: BLE001
+                log.error("inject profile=%s pod=%s failed: %s", req.profile, claimed_pod, e)
+                raise HTTPException(status_code=502, detail=f"inject failed: {e}") from e
+        else:
             raise HTTPException(status_code=404, detail=f"profile not found: {req.profile}")
-        try:
-            profile = json.loads(path.read_text())
-            injected = _inject_profile_into_pod(claimed_pod, profile)
-            log.info("injected profile=%s into pod=%s result=%s", req.profile, claimed_pod, injected)
-        except HTTPException:
-            raise
-        except Exception as e:                                        # noqa: BLE001
-            log.error("inject profile=%s pod=%s failed: %s", req.profile, claimed_pod, e)
-            raise HTTPException(status_code=502, detail=f"inject failed: {e}") from e
 
     _audit("acquire", lease_id=lease_id, pod=claimed_pod,
            quota_key=quota_key, source_ip=source_ip,
@@ -568,13 +627,32 @@ def release(
             log.warning("save_as requested but PROFILES_DIR unavailable; skipped")
         else:
             try:
-                profile = _dump_profile_from_pod(pod, req.save_domain_filter)
-                path = _profile_path(req.save_as)
-                path.write_text(json.dumps(profile, indent=2))
-                saved_to = str(path)
-                log.info("saved profile=%s pod=%s cookies=%d origins=%d → %s",
-                         req.save_as, pod, len(profile.get("cookies", [])),
-                         len(profile.get("origins", [])), path)
+                if req.save_domain_filter:
+                    # Domain filtering only exists in the CDP dump — a profile
+                    # tarball is all-or-nothing on disk. Caller opted into the
+                    # narrower format, so IndexedDB is not captured.
+                    profile = _dump_profile_from_pod(pod, req.save_domain_filter)
+                    path = _profile_path(req.save_as)
+                    path.write_text(json.dumps(profile, indent=2))
+                    saved_to = str(path)
+                    log.info("saved profile=%s pod=%s format=json cookies=%d origins=%d → %s",
+                             req.save_as, pod, len(profile.get("cookies", [])),
+                             len(profile.get("origins", [])), path)
+                else:
+                    blob, meta = _snapshot_profile_from_pod(pod, req.save_service_worker)
+                    path = _profile_tar_path(req.save_as)
+                    path.write_bytes(blob)
+                    saved_to = str(path)
+                    # Drop a stale JSON of the same name so acquire's
+                    # tar-then-json fallback can never serve the older, thinner
+                    # copy if the tarball is later removed by hand.
+                    stale = _profile_path(req.save_as)
+                    if stale.exists():
+                        stale.unlink()
+                        log.info("removed superseded json profile=%s", req.save_as)
+                    log.info("saved profile=%s pod=%s format=tar bytes=%d sha256=%s paths=%d → %s",
+                             req.save_as, pod, len(blob), meta.get("sha256", "?")[:12],
+                             len(meta.get("paths", [])), path)
             except HTTPException:
                 raise
             except Exception as e:                                    # noqa: BLE001
@@ -606,16 +684,24 @@ def list_profiles(authorization: Optional[str] = Header(default=None)):
     if not _profiles_enabled():
         raise HTTPException(status_code=503, detail="profiles store unavailable")
     items: list[dict[str, Any]] = []
-    for p in sorted(PROFILES_DIR.glob("*.json")):
-        try:
-            stat = p.stat()
-            items.append({
-                "name": p.stem,
-                "size": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-            })
-        except Exception:                                             # noqa: BLE001
-            continue
+    # Two formats share the store; `covers` is what actually differs and is the
+    # only thing that explains why a restored profile is still logged out.
+    for pattern, fmt, covers in (
+        ("*.tar.gz", "tar", ["cookies", "localStorage", "indexedDB"]),
+        ("*.json", "json", ["cookies", "localStorage"]),
+    ):
+        for p in sorted(PROFILES_DIR.glob(pattern)):
+            try:
+                stat = p.stat()
+                items.append({
+                    "name": p.name[: -len(".tar.gz")] if fmt == "tar" else p.stem,
+                    "format": fmt,
+                    "covers": covers,
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                })
+            except Exception:                                         # noqa: BLE001
+                continue
     return {"profiles": items}
 
 
@@ -624,6 +710,19 @@ def get_profile(name: str, authorization: Optional[str] = Header(default=None)):
     _check_auth(authorization)
     if not _profiles_enabled():
         raise HTTPException(status_code=503, detail="profiles store unavailable")
+    tar_path = _profile_tar_path(name)
+    if tar_path.exists():
+        stat = tar_path.stat()
+        # A tarball is binary and up to ~8 MB; return its shape, not its bytes.
+        # Nothing consumes the body except humans — acquire reads the file
+        # directly off the PVC.
+        return {
+            "name": name,
+            "format": "tar",
+            "covers": {"cookies": True, "localStorage": True, "indexedDB": True},
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        }
     path = _profile_path(name)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"profile not found: {name}")
@@ -650,12 +749,15 @@ def delete_profile(name: str, authorization: Optional[str] = Header(default=None
     _check_auth(authorization)
     if not _profiles_enabled():
         raise HTTPException(status_code=503, detail="profiles store unavailable")
-    path = _profile_path(name)
-    if not path.exists():
+    removed = []
+    for path, fmt in ((_profile_tar_path(name), "tar"), (_profile_path(name), "json")):
+        if path.exists():
+            path.unlink()
+            removed.append(fmt)
+    if not removed:
         raise HTTPException(status_code=404, detail=f"profile not found: {name}")
-    path.unlink()
-    log.info("deleted profile=%s", name)
-    return {"deleted": True, "name": name}
+    log.info("deleted profile=%s formats=%s", name, ",".join(removed))
+    return {"deleted": True, "name": name, "formats": removed}
 
 
 @app.get("/status")

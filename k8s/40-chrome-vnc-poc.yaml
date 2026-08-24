@@ -206,6 +206,16 @@ spec:
             - { name: PUID, value: "1000" }
             - { name: PGID, value: "1000" }
             - { name: TZ,   value: "Asia/Hong_Kong" }
+            # The image ships an s6 `svc-watchdog` that polls once a second and
+            # relaunches the openbox autostart (→ wrapped-chromium) whenever it
+            # disappears — but its run script is `exec sleep infinity` unless
+            # RESTART_APP=true. Without this, a Chromium exit (crash, OOM, or
+            # our own Browser.close) left the pod running with no browser until
+            # the liveness probe recycled the container ~3 min later.
+            # /snapshot and /restore depend on this: both stop Chromium to get a
+            # consistent on-disk profile and rely on the watchdog to bring it
+            # straight back.
+            - { name: RESTART_APP, value: "true" }
             # CHROME_CLI: extra args appended to the Chromium launch command
             # by the linuxserver init scripts.
             - name: CHROME_CLI
@@ -289,12 +299,23 @@ spec:
           env:
             - { name: CONTROL_PORT, value: "9224" }
             - { name: CDP_BASE,     value: "http://localhost:9223" }    # via cdp-relay nginx → chromium 9222
+            - { name: PROFILE_ROOT, value: "/config/.config/chromium" }
           resources:
             requests: { memory: "32Mi", cpu: "10m" }
-            limits:   { memory: "128Mi", cpu: "500m" }
+            # 128Mi was fine for CDP chatter; /snapshot holds the tarball, its
+            # base64 and the JSON response in memory at once (~8Mi × 3 plus node
+            # baseline), so give it room rather than OOM-killing a profile save.
+            limits:   { memory: "384Mi", cpu: "500m" }
           volumeMounts:
             - { name: control-code, mountPath: /app, readOnly: true }
             - { name: x11sock,      mountPath: /tmp/.X11-unix }
+            # Same PVC the chromium container mounts. /snapshot tars the
+            # on-disk profile (IndexedDB is a LevelDB dir — no CDP write API
+            # exists, and WhatsApp Web's session is a non-extractable CryptoKey
+            # that no JS can export, so file-level copy is the only path).
+            # RW: /restore untars over it. This container is root, chromium is
+            # PUID 1000, so /restore chowns back to the profile root's owner.
+            - { name: config,       mountPath: /config }
           readinessProbe:
             httpGet: { path: /healthz, port: 9224 }
             initialDelaySeconds: 3

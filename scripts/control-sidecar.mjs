@@ -15,6 +15,15 @@
 //                         → { schema, saved_at, cookies, origins[{origin, localStorage}] }
 //   POST /inject-profile  body: profile JSON (same shape dump produces)
 //                         → { injected, cookies, origins }
+//   POST /snapshot        body: {include_service_worker?: false}
+//                         → { schema, saved_at, covers, paths, bytes, sha256,
+//                             tar_b64, timing }
+//                           Full on-disk profile tarball — the ONLY format that
+//                           carries IndexedDB, and therefore the only one that
+//                           can restore a WhatsApp Web login. Stops chromium for
+//                           ~2s (s6 svc-watchdog relaunches it).
+//   POST /restore         body: {tar_b64}
+//                         → { restored, bytes, entries, replaced, sha256, timing }
 //   GET  /tabs            → { tabs: [{ url, title, history: [urls] }], at }
 //                           per open page target, its back/forward nav stack
 //                           (Page.getNavigationHistory). Read-only; the
@@ -22,10 +31,16 @@
 
 import http from 'node:http'
 import net from 'node:net'
+import fs from 'node:fs/promises'
+import crypto from 'node:crypto'
+import { spawn } from 'node:child_process'
 
 const PORT     = parseInt(process.env.CONTROL_PORT || '9224', 10)
 const CDP_BASE = process.env.CDP_BASE || 'http://localhost:9223'
 const HOMEPAGE = process.env.HOMEPAGE_URL || 'about:blank'
+// The Chromium profile on the per-pod `config` PVC. Read by /wipe (origin
+// discovery) and by /snapshot + /restore (the tarball).
+const PROFILE_ROOT = process.env.PROFILE_ROOT || '/config/.config/chromium'
 
 let lastWipe = null
 
@@ -118,6 +133,70 @@ function originsFromCookies(cookies) {
 // it — as this used to — reads the wrong (empty) bucket and silently reports
 // success. The open tabs are the authoritative source: they are the origins the
 // leaseholder was really signed in to.
+// --- disk-derived origins (the wipe safety net) --- //
+// Open tabs + cookie domains both miss the same case: an origin that stored
+// something and then had its tab closed AND holds no cookie. A site that keeps
+// its whole session in IndexedDB (web.whatsapp.com is exactly this) is
+// invisible to both, so /wipe would skip it and leak the session into the next
+// lease. The profile directory on disk cannot miss it — the data IS the
+// directory.
+//
+// Two sources, because Chromium lays them out differently:
+//   IndexedDB    one dir per origin: `https_web.whatsapp.com_0.indexeddb.leveldb`
+//   Local Storage  ONE shared LevelDB; origins appear inside it as `META:<origin>`
+// The second needs a byte scan, but these files are small (hundreds of KB) and
+// a plain regex over them is far cheaper than opening a LevelDB.
+const LOCAL_STORAGE_SCAN_BUDGET = 32 * 1024 * 1024   // stop reading past this
+
+function originFromIdbDirName(name) {
+  // `<scheme>_<host>_<port>.indexeddb.leveldb`; host may itself contain `_`,
+  // so peel scheme off the front and port off the back rather than splitting.
+  const base = name.replace(/\.indexeddb\.leveldb$/, '')
+  const us = base.indexOf('_')
+  const ue = base.lastIndexOf('_')
+  if (us < 0 || ue <= us) return null
+  const scheme = base.slice(0, us)
+  const host = base.slice(us + 1, ue)
+  const port = base.slice(ue + 1)
+  if (scheme !== 'https' && scheme !== 'http') return null
+  if (!host) return null
+  // port 0 is Chromium's "default port" marker, not a real port.
+  return port && port !== '0' ? `${scheme}://${host}:${port}` : `${scheme}://${host}`
+}
+
+async function originsFromDisk() {
+  const out = new Set()
+
+  try {
+    const dir = `${PROFILE_ROOT}/Default/IndexedDB`
+    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+      if (!e.isDirectory() || !e.name.endsWith('.indexeddb.leveldb')) continue
+      const o = originFromIdbDirName(e.name)
+      if (o) out.add(o)
+    }
+  } catch {}   // no mount / no IndexedDB yet — the other sources still apply
+
+  try {
+    const dir = `${PROFILE_ROOT}/Default/Local Storage/leveldb`
+    let budget = LOCAL_STORAGE_SCAN_BUDGET
+    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+      if (!e.isFile()) continue
+      if (!/\.(ldb|log)$/.test(e.name)) continue
+      if (budget <= 0) break
+      let buf
+      try { buf = await fs.readFile(`${dir}/${e.name}`) } catch { continue }
+      budget -= buf.length
+      // latin1 keeps every byte addressable as one char, so offsets in the
+      // regex match the file and no multi-byte decode can split a key.
+      for (const m of buf.toString('latin1').matchAll(/META:(https?:\/\/[^\x00-\x20"']{1,255})/g)) {
+        try { out.add(new URL(m[1]).origin) } catch {}
+      }
+    }
+  } catch {}
+
+  return out
+}
+
 async function discoverOrigins(cookies = []) {
   const out = new Set()
   for (const t of await listTargets()) {
@@ -129,6 +208,10 @@ async function discoverOrigins(cookies = []) {
   }
   // Cookie domains stay as a fallback for tabs closed before release.
   for (const o of originsFromCookies(cookies)) out.add(o)
+  // Disk last: catches the cookie-less, tab-less origins the two above cannot
+  // see. Clearing an origin that stored nothing is a no-op, so over-collecting
+  // here is free — under-collecting is what leaks a session.
+  for (const o of await originsFromDisk()) out.add(o)
   return out
 }
 
@@ -522,6 +605,223 @@ async function tabs() {
   return { tabs: out, at: new Date().toISOString() }
 }
 
+// --------------------------------------------------------------------------- //
+// Full-profile snapshot / restore                                             //
+// --------------------------------------------------------------------------- //
+//
+// Why this exists: the JSON profile above (`/dump-profile`) covers cookies +
+// localStorage and nothing else, because those are the only two stores CDP can
+// both read AND write. IndexedDB is readable via the `IndexedDB.*` domain but
+// there is no write side, and the values that matter most are not even
+// representable in JSON — WhatsApp Web keeps its session as **non-extractable
+// CryptoKey objects**, which by definition no JS or CDP API can export. So a
+// JSON round-trip can never restore that login, no matter how many stores we
+// add to it.
+//
+// What does work is copying the on-disk profile. IndexedDB is a LevelDB
+// directory, Local Storage is a LevelDB directory, and cookies are a SQLite
+// file — all of them portable between pods here because chromium runs with
+// `--password-store=basic` (see /usr/bin/wrapped-chromium), so OSCrypt derives
+// its key from the hardcoded "peanuts" password rather than a per-host keyring.
+// A tarball taken on chrome-vnc-3 therefore decrypts on chrome-vnc-5.
+//
+// Chromium must not be running while its profile is read or written:
+//  - Restore is obvious — Chromium holds the LevelDB LOCK files and would both
+//    ignore and clobber anything written underneath it.
+//  - Snapshot is subtler. LevelDB writes its WAL with sync=false, which only
+//    means "not durable against a machine crash"; the bytes are in the page
+//    cache and any reader on this host sees them. So a live copy is *usually*
+//    fine — but "usually" is not a property you want in a session key, and a
+//    write landing mid-tar yields a torn manifest. We stop first.
+//
+// Stopping is safe because the image ships an s6 `svc-watchdog` that polls
+// once a second and relaunches the openbox autostart (→ wrapped-chromium) as
+// soon as it disappears. That watchdog is inert unless `RESTART_APP=true`,
+// which k8s/40-chrome-vnc-poc.yaml now sets. Without it a clean `Browser.close`
+// left the pod browser-less until the liveness probe recycled the container
+// ~3 minutes later — which is also what used to happen after any Chromium
+// crash (chrome-vnc-5 was carrying a 387 MB `core` from one).
+
+// Tarred by /snapshot, relative to PROFILE_ROOT. Missing entries are skipped,
+// so this can list paths that only exist on some Chromium versions (cookies
+// moved Default/Cookies → Default/Network/Cookies).
+//
+// Deliberately excluded: everything that is a cache and nothing else — Cache,
+// Code Cache, GPUCache, Dawn*Cache, GrShaderCache, component_crx_cache,
+// Crash Reports. They are the bulk of the 126 MB profile and regenerate on
+// demand; the set below is ~8 MB.
+const SNAPSHOT_PATHS = [
+  'Local State',
+  'Default/Preferences',
+  'Default/Secure Preferences',
+  'Default/Cookies',
+  'Default/Cookies-journal',
+  'Default/Network',            // newer Chromium: Cookies, TransportSecurity here
+  'Default/Local Storage',
+  'Default/Session Storage',
+  'Default/IndexedDB',          // ← the whole point
+  'Default/databases',          // legacy WebSQL
+  'Default/WebStorage',
+  'Default/Web Data',
+  'Default/Login Data',
+  'Default/Trust Tokens',
+]
+
+// 'Service Worker' is opt-in: it is 15 MB of it (ScriptCache/CacheStorage) and
+// restoring a stale registration alongside fresh IndexedDB is more likely to
+// confuse a site than to help it. The registration re-installs on first load.
+const SERVICE_WORKER_PATH = 'Default/Service Worker'
+
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+function run(cmd, args, stdin = null) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const out = [], err = []
+    p.stdout.on('data', d => out.push(d))
+    p.stderr.on('data', d => err.push(d))
+    p.on('error', reject)
+    p.on('close', code => {
+      const stderr = Buffer.concat(err).toString('utf-8')
+      if (code !== 0) return reject(new Error(`${cmd} exited ${code}: ${stderr.slice(0, 400)}`))
+      resolve({ stdout: Buffer.concat(out), stderr })
+    })
+    p.stdin.on('error', () => {})
+    if (stdin) p.stdin.end(stdin)
+    else p.stdin.end()
+  })
+}
+
+// Ask Chromium to exit cleanly so LevelDB flushes and the cookie DB closes.
+// Browser.close never replies — the socket dies with the process — so fire it
+// and poll the relay instead of awaiting the CDP response.
+async function stopChromium(timeoutMs = 25000) {
+  const t0 = Date.now()
+  try {
+    const b = await browserClient()
+    b.send('Browser.close').catch(() => {})
+    setTimeout(() => b.close(), 500)
+  } catch (e) {
+    if (!(await chromiumAlive())) return { down: true, ms: 0, note: 'already down' }
+    return { down: false, ms: Date.now() - t0, error: String(e?.message ?? e) }
+  }
+  while (Date.now() - t0 < timeoutMs) {
+    if (!(await chromiumAlive())) return { down: true, ms: Date.now() - t0 }
+    await sleep(250)
+  }
+  return { down: false, ms: Date.now() - t0, error: 'still alive after Browser.close' }
+}
+
+async function waitChromiumUp(timeoutMs = 90000) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < timeoutMs) {
+    if (await chromiumAlive()) return { up: true, ms: Date.now() - t0 }
+    await sleep(500)
+  }
+  return { up: false, ms: Date.now() - t0, error: 'watchdog did not relaunch chromium' }
+}
+
+async function existingSnapshotPaths(includeServiceWorker) {
+  const wanted = includeServiceWorker ? [...SNAPSHOT_PATHS, SERVICE_WORKER_PATH] : SNAPSHOT_PATHS
+  const present = []
+  for (const rel of wanted) {
+    try { await fs.stat(`${PROFILE_ROOT}/${rel}`); present.push(rel) } catch {}
+  }
+  return present
+}
+
+// A tar entry is only accepted if it stays inside the profile. Anything
+// absolute, anything with a '..' component, and anything not under
+// Default/ or the single top-level 'Local State' file is rejected outright —
+// the tarball arrives from the allocator's profile store, which is writable
+// via PUT /profiles/{name}.
+function assertSafeEntries(entries) {
+  for (const raw of entries) {
+    const e = raw.replace(/\/+$/, '')
+    if (!e) continue
+    if (e.startsWith('/') || e.includes('\0')) throw new Error(`unsafe tar entry: ${raw}`)
+    const parts = e.split('/')
+    if (parts.includes('..') || parts.includes('.')) throw new Error(`unsafe tar entry: ${raw}`)
+    if (!(e === 'Local State' || parts[0] === 'Default')) {
+      throw new Error(`tar entry outside profile: ${raw}`)
+    }
+  }
+}
+
+async function snapshotProfile({ include_service_worker = false } = {}) {
+  const t0 = Date.now()
+  const stopped = await stopChromium()
+  if (!stopped.down) {
+    throw new Error(`refusing to snapshot a live profile: ${stopped.error || 'chromium still running'}`)
+  }
+  let tar, paths, restarted
+  try {
+    paths = await existingSnapshotPaths(include_service_worker)
+    if (!paths.length) throw new Error(`no profile paths found under ${PROFILE_ROOT}`)
+    tar = (await run('tar', ['-czf', '-', '-C', PROFILE_ROOT, ...paths])).stdout
+  } finally {
+    // Always bring the browser back, even if tar blew up.
+    restarted = await waitChromiumUp()
+  }
+  return {
+    schema: 'browser-pool/profile-tar@v1',
+    saved_at: new Date().toISOString(),
+    covers: { cookies: true, localStorage: true, indexedDB: true, serviceWorkers: !!include_service_worker },
+    paths,
+    bytes: tar.length,
+    sha256: crypto.createHash('sha256').update(tar).digest('hex'),
+    tar_b64: tar.toString('base64'),
+    timing: { stop: stopped, restart: restarted, total_ms: Date.now() - t0 },
+  }
+}
+
+async function restoreProfile({ tar_b64 } = {}) {
+  if (typeof tar_b64 !== 'string' || !tar_b64) throw new Error('tar_b64 missing')
+  const tar = Buffer.from(tar_b64, 'base64')
+  if (tar.length < 3 || tar[0] !== 0x1f || tar[1] !== 0x8b) throw new Error('tar_b64 is not a gzip stream')
+
+  // Validate BEFORE stopping the browser, so a bad payload costs nothing.
+  const listing = (await run('tar', ['-tzf', '-'], tar)).stdout.toString('utf-8')
+  const entries = listing.split('\n').map(s => s.trim()).filter(Boolean)
+  if (!entries.length) throw new Error('tarball is empty')
+  assertSafeEntries(entries)
+
+  // Directories being replaced wholesale. LevelDB stores must not be merged:
+  // leaving stale .ldb/MANIFEST files next to restored ones gives a corrupt DB.
+  const replaced = [...new Set(
+    entries.filter(e => e.startsWith('Default/'))
+           .map(e => e.replace(/\/+$/, '').split('/').slice(0, 2).join('/'))
+  )]
+
+  const t0 = Date.now()
+  const stopped = await stopChromium()
+  if (!stopped.down) {
+    throw new Error(`refusing to overwrite a live profile: ${stopped.error || 'chromium still running'}`)
+  }
+  let restarted
+  try {
+    for (const rel of replaced) {
+      await fs.rm(`${PROFILE_ROOT}/${rel}`, { recursive: true, force: true }).catch(() => {})
+    }
+    await fs.mkdir(PROFILE_ROOT, { recursive: true })
+    await run('tar', ['-xzf', '-', '-C', PROFILE_ROOT], tar)
+    // The control container is root; chromium runs as PUID/PGID (1000). Match
+    // whatever already owns the profile root rather than hardcoding the uid.
+    const owner = await fs.stat(PROFILE_ROOT)
+    await run('chown', ['-R', `${owner.uid}:${owner.gid}`, PROFILE_ROOT])
+  } finally {
+    restarted = await waitChromiumUp()
+  }
+  return {
+    restored: true,
+    bytes: tar.length,
+    entries: entries.length,
+    replaced,
+    sha256: crypto.createHash('sha256').update(tar).digest('hex'),
+    timing: { stop: stopped, restart: restarted, total_ms: Date.now() - t0 },
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')
   res.setHeader('Content-Type', 'application/json')
@@ -529,6 +829,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/wipe')             res.end(JSON.stringify(await wipe()))
     else if (req.method === 'POST' && url.pathname === '/dump-profile') res.end(JSON.stringify(await dumpProfile(await readBody(req))))
     else if (req.method === 'POST' && url.pathname === '/inject-profile') res.end(JSON.stringify(await injectProfile(await readBody(req))))
+    else if (req.method === 'POST' && url.pathname === '/snapshot')   res.end(JSON.stringify(await snapshotProfile(await readBody(req))))
+    else if (req.method === 'POST' && url.pathname === '/restore')    res.end(JSON.stringify(await restoreProfile(await readBody(req))))
     else if (req.method === 'GET' && url.pathname === '/tabs')          res.end(JSON.stringify(await tabs()))
     else if (req.method === 'GET' && url.pathname === '/status')       res.end(JSON.stringify(await status()))
     else if (req.method === 'GET' && url.pathname === '/healthz')      res.end(JSON.stringify({ ok: true }))

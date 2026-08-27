@@ -224,7 +224,9 @@ Full details: each tool's schema is in the MCP server registration; call `tool_s
 ## 8. Operating notes (read once before you start using)
 
 - **Lazy acquire**: the first `browser_*` call leases a pod. No allocation until then.
-- **Idle release**: 5 min of no `browser_*` calls auto-releases the pod. Reset by any tool call. Paused during `help_mode` (between `browser_request_user_help` and `browser_wait_for_user_done`).
+- **Idle release**: 25 min of no `browser_*` calls auto-releases the pod. Reset by any tool call. Paused during `help_mode` (between `browser_request_user_help` and `browser_wait_for_user_done`), during a `browser_hold`, or entirely with `BROWSER_POOL_IDLE_RELEASE_MS=0`.
+- **Heartbeat**: while a lease is held the client POSTs `/extend` to roll the server-side deadline forward, so the pod is freed some minutes after the client goes quiet rather than at a fixed hour. `MAX_SESSION` (4h) is the ceiling no heartbeat can raise.
+- **`browser_hold({minutes})`**: pauses the idle reaper and keeps the lease renewed. Call it before you hand a human a `view_url` from `browser_get_view_url` — `browser_request_user_help` already does this for you.
 - **Per-token concurrent cap**: pool enforces `MAX_LEASES_PER_TOKEN=3` (production default, bumped 1→3 on 2026-06-21). A 4th concurrent lease on the same service token returns 429 `token_quota_exceeded`. Release before re-acquiring. Note operators may share one token across machines, so the 3 is shared — the live number is `max_leases_per_token` in `GET /admin/status`.
 - **Pool exhaustion**: pool size is 6 pods total (shared across ALL agents/operators using the same allocator; `k8s/40-chrome-vnc-poc.yaml` `replicas` is authoritative, live count is `pool_size` in `GET /status`). When full, your `acquire` returns 423 `pool_exhausted` + `Retry-After: 30`. Retry with backoff or release any active leases.
 - **Profile inject = sticky session**: `browser_load_profile` injects cookies into a freshly-wiped pod. To save updated state back (e.g. FB rotates session token), call `browser_release {save_as: <name>}`. Without `save_as`, the pod is wiped on release — anything you did is lost.

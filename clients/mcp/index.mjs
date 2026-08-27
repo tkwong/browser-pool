@@ -8,8 +8,11 @@
  *   - MCP startup: NO pod acquired (lazy).
  *   - First `browser_*` tool call: POST allocator/acquire -> Playwright
  *     connectOverCDP -> ready.
- *   - Idle for BROWSER_POOL_IDLE_RELEASE_MS (default 5 min): auto-release.
- *     Idle timer is PAUSED while a user-help session is open.
+ *   - Idle for BROWSER_POOL_IDLE_RELEASE_MS (default 25 min): auto-release.
+ *     PAUSED while a user-help session is open or a browser_hold is active.
+ *   - Heartbeat: while a lease is held, POST allocator/extend keeps the
+ *     server-side TTL rolling, so the pod is freed N seconds after the client
+ *     goes quiet rather than at a fixed wall-clock hour.
  *   - SIGTERM / SIGINT / process exit: release lease (best-effort).
  *
  * Required env (no default — you MUST set one of):
@@ -24,7 +27,8 @@
  * Optional:
  *   BROWSER_POOL_TIER              default "chrome-vnc"
  *   BROWSER_POOL_ACQUIRE_TTL       default 3600 (seconds)
- *   BROWSER_POOL_IDLE_RELEASE_MS   default 300000 (5 minutes)
+ *   BROWSER_POOL_IDLE_RELEASE_MS   default 1500000 (25 minutes); 0 disables the idle reaper
+ *   BROWSER_POOL_HEARTBEAT_TTL     default 900 (seconds granted per /extend)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -51,10 +55,20 @@ const TOKEN_FILE =
   join(homedir(), ".config", "browser-pool", "service-token.json");
 const TIER = process.env.BROWSER_POOL_TIER || "chrome-vnc";
 const ACQUIRE_TTL = Number(process.env.BROWSER_POOL_ACQUIRE_TTL || 3600);
+// 25 min, not 5. The risk is asymmetric: a lease left lying around costs a busy
+// pod until the allocator's own ceiling, while a lease reaped out from under a
+// human costs them a half-finished login. 5 minutes was short enough that simply
+// handing someone a viewer link and waiting for them tripped it (2026-08-27).
+// Set to 0 to disable the client-side reaper entirely and rely on the allocator.
 const IDLE_RELEASE_MS = Number(
-  process.env.BROWSER_POOL_IDLE_RELEASE_MS || 5 * 60 * 1000
+  process.env.BROWSER_POOL_IDLE_RELEASE_MS ?? 25 * 60 * 1000
 );
 const IDLE_CHECK_MS = 30_000;
+// Seconds of life each /extend asks for. Small on purpose: it bounds how long a
+// pod stays claimed after this process dies without releasing.
+const HEARTBEAT_TTL = Number(process.env.BROWSER_POOL_HEARTBEAT_TTL || 900);
+// Renew once the lease has less than this left, rather than on every tick.
+const EXTEND_MARGIN_MS = 5 * 60 * 1000;
 
 // CF Access service-token headers. Resolution order:
 //   1. BROWSER_TOKEN env (colon-separated "client_id:client_secret")
@@ -93,10 +107,12 @@ let context = null;         // BrowserContext
 let page = null;            // currently focused Page
 let lastActivityMs = Date.now();
 let helpFlags = {};         // help_id -> { reason, started_at, condition }
+let holdUntilMs = 0;        // browser_hold: keep the lease alive until this ms
 
 const log = (msg) => console.error(`[browser-pool ${new Date().toISOString()}] ${msg}`);
 
 const isHelpModeActive = () => Object.keys(helpFlags).length > 0;
+const isHoldActive = () => Date.now() < holdUntilMs;
 
 // --------------------------------------------------------------------------- //
 //  Allocator client                                                           //
@@ -159,6 +175,37 @@ async function allocatorViewers(leaseId) {
   } catch {
     return -1;
   }
+}
+
+// Heartbeat: push the lease's server-side deadline out. Every failure mode
+// returns null and is survivable — the allocator TTL remains the backstop, so a
+// hiccup here can only shorten a session, never strand a pod. A 404 also covers
+// an older allocator that has no /extend route at all.
+async function allocatorExtend(leaseId, ttl = HEARTBEAT_TTL) {
+  try {
+    const r = await fetch(`${ALLOCATOR}/extend`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...CF_HEADERS },
+      body: JSON.stringify({ lease_id: leaseId, ttl }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 409) {
+      log(`extend refused (${j?.detail?.error || "max_session_exceeded"}) — lease will expire on schedule`);
+      return null;
+    }
+    if (!r.ok) return null;
+    if (lease && lease.lease_id === leaseId && j.expires_at) lease.expires_at = j.expires_at;
+    return j;
+  } catch {
+    return null;
+  }
+}
+
+// Is the lease close enough to its deadline to be worth renewing?
+function leaseExpiringSoon() {
+  const t = Date.parse(lease?.expires_at || "");
+  if (!Number.isFinite(t)) return true;      // unknown deadline -> just renew
+  return t - Date.now() < EXTEND_MARGIN_MS;
 }
 
 async function allocatorProfilesGet(path = "") {
@@ -271,7 +318,14 @@ let idleRetryAfterMs = 0;
 const IDLE_REFUSAL_BACKOFF_MS = 60_000;
 const reaper = setInterval(async () => {
   if (!lease) return;
+  // Heartbeat FIRST, and unconditionally — especially during help/hold, which is
+  // exactly when nobody is calling tools and the old fixed TTL used to run out
+  // mid-login.
+  if (leaseExpiringSoon()) await allocatorExtend(lease.lease_id);
+  if (!lease) return;             // released while we were awaiting
   if (isHelpModeActive()) return; // user is in the middle of helping — don't yank
+  if (isHoldActive()) return;     // agent explicitly asked to keep this lease
+  if (IDLE_RELEASE_MS <= 0) return;  // client-side reaper disabled by config
   if (Date.now() < idleRetryAfterMs) return;
   if (Date.now() - lastActivityMs > IDLE_RELEASE_MS) {
     const r = await teardown("idle");
@@ -435,14 +489,28 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "browser_hold",
+    description:
+      "Keep this lease alive for N more minutes: pauses the client-side idle auto-release AND keeps the allocator's TTL renewed. Call it BEFORE handing the viewer to a human (login, 2FA, captcha, payment) or before any long stretch where you will not call another browser_* tool — otherwise the session can be reaped out from under them. Pass minutes: 0 to drop the hold. Bounded by the allocator's MAX_SESSION ceiling (see max_session_seconds in browser_get_session_info); browser_request_user_help already implies a hold until browser_wait_for_user_done returns.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        minutes: {
+          type: "number",
+          description: "Minutes to hold from now (default 30). 0 clears the hold and resumes normal idle timing.",
+        },
+      },
+    },
+  },
+  {
     name: "browser_get_session_info",
-    description: "Return { active, lease_id, view_url, cdp_url, pod, current_url, idle_seconds, help_mode, viewers }. `viewers` > 0 means a human has the noVNC viewer open right now (-1 = unknown) — check it before releasing.",
+    description: "Return { active, lease_id, view_url, cdp_url, pod, current_url, idle_seconds, help_mode, holding, expires_at, viewers }. `viewers` > 0 means a human has the noVNC viewer open right now (-1 = unknown) — check it before releasing.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "browser_request_user_help",
     description:
-      "Signal that you need a human to interact with the browser (e.g. solve captcha, log in). Returns immediately with a view_url to share with the user. The idle reaper is paused until browser_wait_for_user_done finishes. After calling this, paste view_url to the user (e.g. via your Telegram MCP) and then call browser_wait_for_user_done to sync.",
+      "Signal that you need a human to interact with the browser (e.g. solve captcha, log in). Returns immediately with a view_url to share with the user. The idle reaper is paused AND the allocator lease is kept renewed until browser_wait_for_user_done finishes, so the session cannot be reaped mid-login. After calling this, paste view_url to the user (e.g. via your Telegram MCP) and then call browser_wait_for_user_done to sync. Do NOT just hand out browser_get_view_url and wait — that path has no such protection (use browser_hold if you need it).",
     inputSchema: {
       type: "object",
       required: ["reason"],
@@ -705,6 +773,25 @@ async function handleTool(name, args) {
       await ensureBrowser();
       return { view_url: lease.view_url, lease_id: lease.lease_id, pod: lease.pod };
     }
+    case "browser_hold": {
+      await ensureBrowser();
+      const minutes = args?.minutes === undefined ? 30 : Number(args.minutes);
+      if (!Number.isFinite(minutes) || minutes < 0) {
+        throw new Error("minutes must be a non-negative number");
+      }
+      holdUntilMs = minutes > 0 ? Date.now() + minutes * 60_000 : 0;
+      const ext = minutes > 0 ? await allocatorExtend(lease.lease_id) : null;
+      log(minutes > 0 ? `hold set for ${minutes}min` : "hold cleared");
+      return {
+        holding: minutes > 0,
+        hold_seconds: minutes > 0 ? Math.round(minutes * 60) : 0,
+        lease_expires_at: ext?.expires_at ?? lease.expires_at,
+        max_session_seconds: ext?.max_session_seconds ?? null,
+        note: minutes > 0
+          ? "Idle auto-release paused and the allocator lease is being kept renewed. Call browser_hold({minutes: 0}) when the human is done."
+          : "Hold cleared — normal idle timing resumed.",
+      };
+    }
     case "browser_get_session_info": {
       if (!lease) return { active: false };
       return {
@@ -719,6 +806,8 @@ async function handleTool(name, args) {
         idle_release_seconds: Math.round(IDLE_RELEASE_MS / 1000),
         help_mode: isHelpModeActive(),
         active_help_ids: Object.keys(helpFlags),
+        holding: isHoldActive(),
+        hold_seconds_remaining: isHoldActive() ? Math.round((holdUntilMs - Date.now()) / 1000) : 0,
         // >0 means a human has the noVNC viewer open right now; -1 = unknown.
         viewers: lease ? await allocatorViewers(lease.lease_id) : 0,
       };
@@ -741,7 +830,7 @@ async function handleTool(name, args) {
         instructions:
           `Share this URL with the user: ${lease.view_url}\n` +
           `Then call browser_wait_for_user_done({help_id: "${help_id}", condition: {...}}) to block until the user is done. ` +
-          `The idle reaper is paused until then.`,
+          `The idle reaper is paused and the lease is kept alive until then.`,
       };
     }
     case "browser_wait_for_user_done": {
@@ -754,6 +843,7 @@ async function handleTool(name, args) {
       const interval = args.poll_interval_ms || 2000;
       const satisfied = await pollCondition(cond, deadlineMs, interval);
       delete helpFlags[args.help_id];
+      if (!isHelpModeActive()) holdUntilMs = 0;
       lastActivityMs = Date.now();
       const outcome = satisfied ? "satisfied" : "timeout";
       log(`user help (${args.help_id}) -> ${outcome}`);

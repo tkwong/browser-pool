@@ -53,8 +53,36 @@ readiness probe can't false-positive. The allocator refuses `/release` with
 **409 `viewer_attached`** when that count is > 0, and exposes
 `GET /viewers/{lease_id}` so a client can preflight *before* it closes its own
 browser handle. `force: true` overrides; `viewers: -1` means unknown and never
-blocks, so a sidecar outage can't strand a lease. The TTL reaper does not go
-through `/release`, so the hard backstop is unaffected.
+blocks, so a sidecar outage can't strand a lease.
+
+The TTL reaper does not go through `/release`, so for a long time nothing
+protected *it* — on 2026-08-27 the hour ran out while an operator was mid-login
+and the reaper wiped the pod under them. It is now viewer-aware too: an expired
+lease with a live viewer is deferred `VIEWER_HOLD_GRACE` (60s) at a time instead
+of wiped. **`MAX_SESSION` (default 4h) is the hard backstop now** — no viewer and
+no heartbeat can push a lease past it, so a pod always comes back.
+
+## Lease lifetime: heartbeat, not wall clock
+
+`ttl` on `/acquire` is capped at `MAX_TTL` (1h), which used to be an absolute
+death sentence. `POST /extend` makes it a rolling window: each call grants up to
+`MAX_TTL` **from now**, so a client that checks in lives on and a client that
+goes silent still dies within its last granted ttl. The MCP client heartbeats
+from its existing 30s timer whenever the lease has under 5 min left.
+
+Two independent reapers, and they are not the same thing — the 2026-08-27
+post-mortem turned on telling them apart:
+
+| | client idle reaper (`clients/mcp/index.mjs`) | allocator TTL reaper (`allocator/main.py`) |
+|---|---|---|
+| Trigger | no `browser_*` call for `IDLE_RELEASE_MS` (**25 min**) | `expires_at` passed |
+| Path | `POST /release` → viewer guard applies (409 → backoff) | direct wipe → its own `_viewer_hold()` check |
+| Paused by | `help_mode`, `browser_hold`, or `IDLE_RELEASE_MS=0` | a live viewer, up to `MAX_SESSION` |
+
+`browser_hold({minutes})` is the agent-facing knob: it pauses the client idle
+reaper *and* keeps the lease renewed. Use it before handing out a `view_url`
+yourself — `browser_request_user_help` already implies it, a bare
+`browser_get_view_url` does not.
 
 Note the tail: after the human closes the tab, cloudflared holds origin
 keep-alives for up to ~90s (measured: 4 sockets at +8s, 0 by ~+80s), so the

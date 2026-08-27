@@ -96,6 +96,13 @@ MAX_LEASES_PER_TOKEN = int(os.environ.get("MAX_LEASES_PER_TOKEN", "0"))
 DEFAULT_TTL = int(os.environ.get("DEFAULT_TTL_SECONDS", "600"))   # 10 min
 MAX_TTL = int(os.environ.get("MAX_TTL_SECONDS", "3600"))          # 1 hour
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL_SECONDS", "10"))
+# Absolute ceiling on one lease's life, however many times it is extended or
+# deferred for a watching human. The backstop that guarantees a pod always comes
+# back even if a client heartbeats forever.
+MAX_SESSION = int(os.environ.get("MAX_SESSION_SECONDS", "14400"))     # 4 hours
+# While a human has the viewer open on an already-expired lease, re-check this
+# often instead of asking the sidecar every REAPER_INTERVAL.
+VIEWER_HOLD_GRACE = int(os.environ.get("VIEWER_HOLD_GRACE_SECONDS", "60"))
 SERVICE_TOKEN = os.environ.get("ALLOCATOR_SERVICE_TOKEN", "")
 
 # Quick Tunnel (CF Cloudflare Tunnel "trycloudflare.com" mode) — per-lease
@@ -450,6 +457,11 @@ class ReleaseReq(BaseModel):
     force: bool = Field(default=False, description="Release even if a human currently has the pod's noVNC viewer open. Off by default: releasing wipes the profile and kills the viewer tunnel, which destroys a login the operator is in the middle of.")
 
 
+class ExtendReq(BaseModel):
+    lease_id: str
+    ttl: Optional[int] = Field(default=None, ge=10, le=MAX_TTL, description=f"seconds from NOW, default {DEFAULT_TTL}, max {MAX_TTL}. Each call restarts the window: a heartbeating client lives on, a silent one still dies within its last granted ttl.")
+
+
 # --------------------------------------------------------------------------- #
 # Routes                                                                      #
 # --------------------------------------------------------------------------- #
@@ -704,6 +716,59 @@ def release(
             "saved_format": saved_format}
 
 
+@app.post("/extend")
+def extend(
+    req: ExtendReq,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Push an active lease's expiry out — the heartbeat that lets a session
+    outlive MAX_TTL.
+
+    Until this existed the only lever was the one-shot ttl handed to /acquire,
+    capped at MAX_TTL, so any human-in-the-loop session (login, 2FA, captcha)
+    running past the hour was killed mid-flight by the reaper — the 2026-08-27
+    OCBC incident. Extension is a rolling window: the client checks in and the
+    deadline moves; the client goes quiet and the lease dies within its last
+    granted ttl. MAX_SESSION is the ceiling no heartbeat can raise.
+    """
+    _check_auth(authorization)
+    ttl = req.ttl or DEFAULT_TTL
+    with _lock:
+        pod = _lease_to_pod.get(req.lease_id)
+        st = _state.get(pod) if pod else None
+        if not pod or not st or st["lease_id"] != req.lease_id:
+            raise HTTPException(status_code=404, detail="lease_not_found")
+        leased_at = st.get("leased_at")
+        age = (_now() - leased_at).total_seconds() if leased_at else 0.0
+        if age >= MAX_SESSION:
+            raise HTTPException(status_code=409, detail={
+                "error": "max_session_exceeded",
+                "pod": pod,
+                "age_seconds": int(age),
+                "max_session_seconds": MAX_SESSION,
+                "hint": "release and acquire a fresh lease — one lease cannot be held past this ceiling",
+            })
+        new_exp = _now() + timedelta(seconds=ttl)
+        if leased_at:                       # a heartbeat must not outrun the ceiling
+            new_exp = min(new_exp, leased_at + timedelta(seconds=MAX_SESSION))
+        st["expires_at"] = new_exp
+        st["extends"] = st.get("extends", 0) + 1
+        extends = st["extends"]
+    # Deliberately not _audit()ed: a 30s heartbeat would drown the audit log.
+    # The running count is on /admin/status; announce only the first check-in.
+    if extends == 1:
+        log.info("lease heartbeating pod=%s lease=%s ttl=%ds", pod, req.lease_id, ttl)
+    return {
+        "lease_id": req.lease_id,
+        "pod": pod,
+        "expires_at": new_exp.isoformat(),
+        "ttl": ttl,
+        "extends": extends,
+        "age_seconds": int(age),
+        "max_session_seconds": MAX_SESSION,
+    }
+
+
 @app.get("/viewers/{lease_id}")
 def viewers(
     lease_id: str,
@@ -943,6 +1008,8 @@ def admin_status(authorization: Optional[str] = Header(default=None)):
                 "source_ip": st.get("source_ip"),
                 "profile": st.get("profile"),
                 "view_url": st.get("view_url"),
+                "extends": st.get("extends", 0),
+                "viewer_held": st.get("viewer_held", 0),
                 "chromium": side,
             })
     return {
@@ -951,6 +1018,7 @@ def admin_status(authorization: Optional[str] = Header(default=None)):
         "pods": pods,
         "queue": _recent_exhausted_summary(),
         "max_leases_per_token": MAX_LEASES_PER_TOKEN,
+        "max_session_seconds": MAX_SESSION,
     }
 
 
@@ -1274,18 +1342,65 @@ def admin_html():
 # --------------------------------------------------------------------------- #
 # Background reaper                                                           #
 # --------------------------------------------------------------------------- #
+def _viewer_hold(pod: str, snap: dict) -> bool:
+    """Should this expired lease be spared because a human is watching it?
+
+    /release has had a viewer guard since 2026-08-24, but the TTL reaper does not
+    go through /release, so nothing protected it: on 2026-08-27 an operator was
+    mid-login in the noVNC viewer at the exact moment the hour ran out and the
+    reaper wiped the pod under them. Socket presence is the same deliberately
+    conservative signal /release uses — a false "someone is watching" only delays
+    the wipe, a false "nobody is watching" destroys a live login. MAX_SESSION
+    still caps it, and -1 (unknown) never holds, so a sidecar outage cannot
+    strand a pod.
+    """
+    leased_at = snap.get("leased_at")
+    if leased_at and (_now() - leased_at).total_seconds() >= MAX_SESSION:
+        log.info("reaper: MAX_SESSION reached pod=%s lease=%s — expiring despite any viewer",
+                 pod, snap["lease_id"])
+        return False
+    n = _sidecar_viewers(pod)
+    if n <= 0:
+        return False
+    with _lock:
+        cur = _state.get(pod)
+        if not cur or cur["lease_id"] != snap["lease_id"]:
+            return False                     # released/re-acquired while we asked
+        cur["expires_at"] = _now() + timedelta(seconds=VIEWER_HOLD_GRACE)
+        cur["viewer_held"] = cur.get("viewer_held", 0) + 1
+        held = cur["viewer_held"]
+    log.info("reaper: expiry deferred pod=%s lease=%s viewers=%d hold=%d",
+             pod, snap["lease_id"], n, held)
+    return True
+
+
 def _reaper() -> None:
     while True:
         time.sleep(REAPER_INTERVAL)
-        expired: list[tuple[str, dict]] = []
+        # Phase 1 (locked): choose candidates only — no mutation, and no I/O,
+        # since _sidecar_viewers() below is a network call that must never run
+        # while holding _lock.
         with _lock:
             now = _now()
-            for pod, st in list(_state.items()):
-                if st and st["expires_at"] <= now:
-                    log.info("expiring lease pod=%s lease=%s", pod, st["lease_id"])
-                    _lease_to_pod.pop(st["lease_id"], None)
-                    _state[pod] = None
-                    expired.append((pod, st))
+            candidates = [(pod, st.copy()) for pod, st in _state.items()
+                          if st and st["expires_at"] <= now]
+        expired: list[tuple[str, dict]] = []
+        for pod, snap in candidates:
+            if _viewer_hold(pod, snap):
+                continue
+            # Phase 2 (locked): re-validate. While we were off-lock the lease may
+            # have been released, the pod re-acquired by someone else, or the
+            # deadline pushed out by /extend.
+            with _lock:
+                st = _state.get(pod)
+                if not st or st["lease_id"] != snap["lease_id"]:
+                    continue
+                if st["expires_at"] > _now():
+                    continue
+                log.info("expiring lease pod=%s lease=%s", pod, st["lease_id"])
+                _lease_to_pod.pop(st["lease_id"], None)
+                _state[pod] = None
+                expired.append((pod, st))
         for pod, st in expired:
             tabs = _sidecar_tabs(pod)               # before wipe
             _kill_quick_tunnel(st)
@@ -1294,7 +1409,8 @@ def _reaper() -> None:
             _audit("expire", lease_id=st["lease_id"], pod=pod,
                    quota_key=st.get("quota_key", "anonymous"),
                    source_ip=st.get("source_ip", "unknown"),
-                   duration_s=duration, tabs=tabs)
+                   duration_s=duration, tabs=tabs,
+                   extends=st.get("extends", 0), viewer_held=st.get("viewer_held", 0))
 
 
 threading.Thread(target=_reaper, daemon=True, name="reaper").start()

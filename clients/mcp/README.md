@@ -11,7 +11,7 @@ human takeover.
 |---|---|---|
 | Browser | Spawns local Chrome | Connects to a remote pool pod over CDP |
 | CDP endpoint | Static, fixed at `--cdp-endpoint` startup arg | Dynamic, fetched from allocator on first tool call |
-| Lifecycle | Browser open for entire MCP lifetime | **Lazy acquire** on first call + **idle release** after 5 min idle |
+| Lifecycle | Browser open for entire MCP lifetime | **Lazy acquire** on first call + **idle release** after 25 min idle, lease kept alive by a `/extend` heartbeat |
 | Human takeover | Not built-in | `browser_request_user_help` → noVNC magic-link → `browser_wait_for_user_done` polls page state |
 | Anti-bot | Whatever local Chrome does | Real headed Chromium in Xvfb (real OS X11 events); passes Cloudflare Turnstile when user clicks via noVNC |
 
@@ -89,7 +89,8 @@ appear.
 ### Human offload
 | tool | purpose |
 |---|---|
-| `browser_request_user_help({reason, wait_for?})` | returns `{help_id, view_url, instructions}`. Pauses the idle reaper. |
+| `browser_request_user_help({reason, wait_for?})` | returns `{help_id, view_url, instructions}`. Pauses the idle reaper **and** keeps the lease renewed. |
+| `browser_hold({minutes})` | pause the idle reaper + keep the lease renewed for N minutes (`0` clears). Use before handing out a `view_url` yourself. |
 | `browser_wait_for_user_done({help_id, condition, deadline_seconds?})` | polls page until `condition` matches; returns `{outcome, final_url, title}` |
 
 #### Typical offload pattern
@@ -123,7 +124,8 @@ if (snap.contains_login_form) {
 | `ALLOCATOR_SERVICE_TOKEN_FILE` | `~/.config/browser-pool/service-token.json` | CF Access service-token JSON (used if `BROWSER_TOKEN` not set) |
 | `BROWSER_POOL_TIER` | `chrome-vnc` | which pool tier to request |
 | `BROWSER_POOL_ACQUIRE_TTL` | `3600` | lease TTL in seconds |
-| `BROWSER_POOL_IDLE_RELEASE_MS` | `300000` | auto-release after this many ms of no tool calls (paused during help) |
+| `BROWSER_POOL_IDLE_RELEASE_MS` | `1500000` | auto-release after this many ms of no tool calls (paused during help/hold). `0` disables it and leaves the allocator TTL as the only reaper |
+| `BROWSER_POOL_HEARTBEAT_TTL` | `900` | seconds of life each `/extend` asks for; bounds how long a pod stays claimed after the client dies |
 
 ## Lifecycle
 

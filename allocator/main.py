@@ -72,6 +72,13 @@ CONTROL_PROFILE_TIMEOUT = int(os.environ.get("CONTROL_PROFILE_TIMEOUT_SECONDS", 
 # s6 watchdog to relaunch it. Measured end-to-end well under 30s, but the wait
 # for a relaunch is capped at 90s sidecar-side, so allow more than that here.
 CONTROL_SNAPSHOT_TIMEOUT = int(os.environ.get("CONTROL_SNAPSHOT_TIMEOUT_SECONDS", "150"))
+# A pod whose wipe did not verify clean is quarantined instead of going back in
+# the free list, and re-wiped every WIPE_RETRY_INTERVAL until it does. Set
+# WIPE_QUARANTINE=false to fall back to the old best-effort behaviour (free the
+# pod regardless) if this ever misfires in prod — it trades a leak risk for
+# capacity, so change it deliberately.
+WIPE_QUARANTINE = os.environ.get("WIPE_QUARANTINE", "true").lower() in ("1", "true", "yes")
+WIPE_RETRY_INTERVAL = int(os.environ.get("WIPE_RETRY_INTERVAL_SECONDS", "60"))
 
 # Named-profile store (Phase 2). One JSON file per profile, name-validated to
 # prevent path traversal. Lives on a PVC mounted at this path so it survives
@@ -150,6 +157,11 @@ _lease_to_pod: dict[str, str] = {}
 # that gap is up to CONTROL_SNAPSHOT_TIMEOUT wide. Acquire must not hand out a
 # pod inside it or the next leaseholder inherits the last one's login.
 _reaping: set[str] = set()
+# Pods whose wipe did NOT verify clean — the previous lease's tabs/storage may
+# still be on them. Held out of the free list (unlike _reaping this is not
+# transient) until the retry thread wipes one clean. pod -> {since, reason,
+# attempts}.
+_dirty: dict[str, dict] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -458,7 +470,7 @@ def _restore_profile_into_pod(pod: str, blob: bytes) -> dict:
         return r.json()
 
 
-def _wipe_pod_profile(pod: str) -> None:
+def _wipe_pod_profile(pod: str) -> bool:
     """POST to the pod's control sidecar to wipe Chromium profile.
 
     Default behaviour on /release: ephemeral. Prevents the next leaseholder
@@ -467,18 +479,96 @@ def _wipe_pod_profile(pod: str) -> None:
     via scripts/dump-profile.mjs (Phase 1 — manual) or pass save_as=name
     when Phase 2 named profiles land.
 
-    Best-effort: if the sidecar is unreachable we log and continue so a
-    flaky control plane doesn't pin pods in leased state.
+    Returns True ONLY for a wipe the sidecar reports as clean. Transport error,
+    non-200, unparseable body, or `clean: false` (tabs left open, origins that
+    refused to clear) all return False, and the caller must keep the pod out of
+    the free list.
+
+    This used to return None and swallow every failure into a log.warning, on
+    the theory that a flaky control plane should not pin pods in leased state.
+    2026-09-15 showed what that trade actually costs: chrome-vnc-0 was reaped at
+    the MAX_SESSION ceiling, freed on an unverified wipe, and the next
+    leaseholder inherited the previous session's tab. A pod short of the pool is
+    cheap; handing someone else's logged-in browser out is not.
     """
     if not CONTROL_URL_TPL:
-        return
+        return True                    # wipe not configured — nothing to verify
     url = f"{CONTROL_URL_TPL.format(pod=pod)}/wipe"
     try:
         with httpx.Client(timeout=CONTROL_WIPE_TIMEOUT) as c:
             r = c.post(url)
-            log.info("wipe pod=%s status=%s body=%s", pod, r.status_code, r.text[:300])
     except Exception as e:                                            # noqa: BLE001
-        log.warning("wipe pod=%s failed (release continues): %s", pod, e)
+        log.error("wipe pod=%s FAILED (sidecar unreachable): %s", pod, e)
+        return False
+    body = r.text[:500]
+    if r.status_code != 200:
+        log.error("wipe pod=%s FAILED status=%s body=%s", pod, r.status_code, body)
+        return False
+    try:
+        data = r.json()
+    except Exception:                                                 # noqa: BLE001
+        log.error("wipe pod=%s FAILED (unparseable body): %s", pod, body)
+        return False
+    # `clean` only exists on a sidecar new enough to measure it. An older one
+    # cannot tell us either way, so fall back to its own claim rather than
+    # quarantining the whole fleet through a rolling sidecar upgrade.
+    if not data.get("clean", data.get("wiped") is True):
+        log.error("wipe pod=%s NOT CLEAN pages_after=%s pages_left=%s tabs_failed=%s origins_failed=%s",
+                  pod, data.get("pages_after"), data.get("pages_left"),
+                  data.get("tabs_failed"), data.get("origins_failed"))
+        return False
+    log.info("wipe pod=%s clean status=%s body=%s", pod, r.status_code, body)
+    return True
+
+
+def _mark_dirty(pod: str, reason: str) -> None:
+    """Quarantine a pod whose wipe did not verify clean."""
+    if not WIPE_QUARANTINE:
+        log.error("wipe pod=%s failed (%s) but WIPE_QUARANTINE is off — "
+                  "pod returns to the free list DIRTY", pod, reason)
+        return
+    with _lock:
+        prev = _dirty.get(pod) or {}
+        entry = {
+            "since": prev.get("since") or _now().isoformat(),
+            "reason": reason,
+            "attempts": prev.get("attempts", 0) + 1,
+        }
+        _dirty[pod] = entry
+    log.error("QUARANTINE pod=%s attempt=%d — %s; held out of the free list "
+              "until a retry wipes it clean", pod, entry["attempts"], reason)
+    _audit("wipe_failed", pod=pod, reason=reason, attempts=entry["attempts"])
+
+
+def _retry_dirty_pods() -> None:
+    """Re-wipe quarantined pods so a transient sidecar failure self-heals.
+
+    Runs on its own thread, not the reaper's: an unreachable sidecar costs
+    CONTROL_WIPE_TIMEOUT per pod, and six of those serially inside the reaper
+    loop would stop leases expiring altogether.
+    """
+    with _lock:
+        pods = [p for p in _dirty if _state.get(p) is None]
+    for pod in pods:
+        if _wipe_pod_profile(pod):
+            with _lock:
+                info = _dirty.pop(pod, None) or {}
+            log.info("QUARANTINE CLEARED pod=%s after %s attempt(s) — back in the free list",
+                     pod, info.get("attempts", "?"))
+            _audit("wipe_recovered", pod=pod, attempts=info.get("attempts"))
+        else:
+            with _lock:
+                if pod in _dirty:
+                    _dirty[pod]["attempts"] = _dirty[pod].get("attempts", 0) + 1
+
+
+def _dirty_retry_loop() -> None:
+    while True:
+        time.sleep(WIPE_RETRY_INTERVAL)
+        try:
+            _retry_dirty_pods()
+        except Exception as e:                                        # noqa: BLE001
+            log.warning("dirty-retry loop: %s", e)
 
 
 # --------------------------------------------------------------------------- #
@@ -706,7 +796,7 @@ def acquire(
                     },
                 )
         for pod in POOL:
-            if _state[pod] is None and pod not in _reaping:
+            if _state[pod] is None and pod not in _reaping and pod not in _dirty:
                 if not _cdp_healthy(pod):
                     log.warning("acquire: skip pod=%s — CDP unhealthy (wedged/OOM); leaving for liveness probe to recycle", pod)
                     continue
@@ -851,6 +941,7 @@ def release(
     saved_format: Optional[str] = None
     trashed: Optional[str] = None
     tabs: list = []
+    wiped_clean = False
     try:
         # Order: save_as BEFORE wipe (else there's nothing to dump).
         if req.save_as:
@@ -904,8 +995,13 @@ def release(
                 (old_state or {}).get("quota_key", "anonymous"))
         if old_state:
             _kill_quick_tunnel(old_state)
-        _wipe_pod_profile(pod)
+        wiped_clean = _wipe_pod_profile(pod)
     finally:
+        # Quarantine BEFORE the pod leaves _reaping, or acquire gets a window on
+        # a pod we already know is dirty. Also covers an exception above, where
+        # the wipe never ran at all.
+        if not wiped_clean:
+            _mark_dirty(pod, "wipe not verified clean on release")
         with _lock:
             _reaping.discard(pod)
 
@@ -1233,7 +1329,7 @@ def status():
             if st is None:
                 # A pod mid-teardown is not free yet — counting it as such is
                 # how a caller concludes the pool has capacity it does not have.
-                if pod not in _reaping:
+                if pod not in _reaping and pod not in _dirty:
                     free += 1
             else:
                 leased.append(
@@ -1246,7 +1342,10 @@ def status():
                     }
                 )
         return {"pool_size": len(POOL), "free": free, "leased": leased,
-                "reaping": sorted(_reaping)}
+                "reaping": sorted(_reaping),
+                # Quarantined: a wipe that did not verify clean. Not free, not
+                # coming back until the retry thread clears it.
+                "dirty": {p: dict(v) for p, v in _dirty.items()}}
 
 
 @app.get("/healthz")
@@ -1342,13 +1441,15 @@ def admin_status(authorization: Optional[str] = Header(default=None)):
     with _lock:
         snap = {pod: (st.copy() if st else None) for pod, st in _state.items()}
         reaping = set(_reaping)          # same instant as snap, else the two disagree
+        dirty = {p: dict(v) for p, v in _dirty.items()}
     pods = []
     for pod, st in snap.items():
         side = _sidecar_status(pod)
         if st is None:
             pods.append({
-                "pod": pod, "free": pod not in reaping,
+                "pod": pod, "free": pod not in reaping and pod not in dirty,
                 "reaping": pod in reaping or None,
+                "dirty": dirty.get(pod),
                 "chromium": side,
             })
         else:
@@ -1374,6 +1475,8 @@ def admin_status(authorization: Optional[str] = Header(default=None)):
         "queue": _recent_exhausted_summary(),
         "max_leases_per_token": MAX_LEASES_PER_TOKEN,
         "max_session_seconds": MAX_SESSION,
+        "wipe_quarantine": WIPE_QUARANTINE,
+        "dirty": dirty,
     }
 
 
@@ -1440,6 +1543,7 @@ _ADMIN_HTML = """<!doctype html>
     td .badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-family:var(--mono)}
     .badge.live{background:rgba(52,211,153,.15);color:var(--green)}
     .badge.free{background:var(--bg3);color:var(--muted)}
+    .badge.dirty{background:rgba(248,113,113,.15);color:var(--red)}
     .badge.release{background:var(--bg3);color:var(--muted)}
     .badge.expire{background:rgba(248,113,113,.15);color:var(--red)}
     .badge.exhausted{background:rgba(251,191,36,.15);color:var(--yellow)}
@@ -1533,7 +1637,8 @@ function renderLive(s) {
     const c = p.chromium || {};
     return `<tr>
       <td class="mono">${p.pod}</td>
-      <td>${p.free ? '<span class="badge free">free</span>' : '<span class="badge live">live</span>'}</td>
+      <td>${p.dirty ? '<span class="badge dirty" title="' + esc(p.dirty.reason || '') + ' (' + (p.dirty.attempts||0) + ' attempt(s))">dirty</span>'
+                    : p.free ? '<span class="badge free">free</span>' : '<span class="badge live">live</span>'}</td>
       <td class="mono">${short(p.lease_id)}</td>
       <td class="mono"><span class="pill">${tail10(p.quota_key)}</span></td>
       <td class="mono">${p.source_ip || '—'}</td>
@@ -1758,6 +1863,7 @@ def _reaper() -> None:
                 _reaping.add(pod)      # unacquirable until the wipe below lands
                 expired.append((pod, st))
         for pod, st in expired:
+            wiped_clean = False
             try:
                 tabs = _sidecar_tabs(pod)           # before wipe
                 # The reaper has no save_as at all, so this path is the only
@@ -1766,8 +1872,10 @@ def _reaper() -> None:
                     pod, st["lease_id"], "expire", tabs,
                     st.get("quota_key", "anonymous"))
                 _kill_quick_tunnel(st)
-                _wipe_pod_profile(pod)
+                wiped_clean = _wipe_pod_profile(pod)
             finally:
+                if not wiped_clean:
+                    _mark_dirty(pod, "wipe not verified clean on expire")
                 with _lock:
                     _reaping.discard(pod)
             duration = int((_now() - st["leased_at"]).total_seconds()) if st.get("leased_at") else None
@@ -1780,3 +1888,4 @@ def _reaper() -> None:
 
 threading.Thread(target=_reaper, daemon=True, name="reaper").start()
 threading.Thread(target=_trash_gc, daemon=True, name="trash-gc").start()
+threading.Thread(target=_dirty_retry_loop, daemon=True, name="dirty-retry").start()

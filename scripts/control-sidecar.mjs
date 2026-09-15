@@ -374,6 +374,7 @@ async function clearClipboard() {
 async function wipe() {
   const browser = await browserClient()
   let wipedSummary = { cookies_seen: 0, origins_seen: 0, origins_wiped: 0, origins_failed: [] }
+  let completed = false
   try {
     const { cookies } = await browser.send('Storage.getCookies')
     // discoverOrigins(), not originsFromCookies(): otherwise a site whose
@@ -419,35 +420,73 @@ async function wipe() {
     await browser.send('Storage.clearCookies')
     const targets = await listTargets()
     const pages = targets.filter(t => t.type === 'page')
+    // Every failure in this loop used to vanish into a bare `catch {}`, and
+    // pages_after below was the literal 1 — so a wipe that left the previous
+    // session's tabs open returned a body byte-identical to a clean one, and
+    // the allocator freed the pod on the strength of it. That is how a
+    // buyee.jp tab outlived a MAX_SESSION reap on 2026-09-15 and turned up in
+    // the next lease. Collect the failures, then re-read the target list and
+    // report what is REALLY still open.
+    const tabsFailed = []
     let keptId = null
     for (const p of pages) {
       if (!keptId) {
         try {
           const c = await pageClient(p.webSocketDebuggerUrl)
-          await c.send('Page.navigate', { url: HOMEPAGE })
-          c.close()
+          try {
+            // Page.navigate RESOLVES with errorText rather than throwing when
+            // the navigation is refused (beforeunload, ERR_ABORTED). Ignoring
+            // the return value leaves the kept tab sitting on the old site
+            // while we record the wipe as a success.
+            const nav = await c.send('Page.navigate', { url: HOMEPAGE })
+            if (nav?.errorText) throw new Error(`navigate refused: ${nav.errorText}`)
+          } finally { c.close() }
           keptId = p.id
           continue
-        } catch {}
+        } catch (e) {
+          tabsFailed.push(`${p.url}: navigate: ${e?.message ?? e}`)
+        }
       }
-      try { await browser.send('Target.closeTarget', { targetId: p.id }) } catch {}
+      try {
+        await browser.send('Target.closeTarget', { targetId: p.id })
+      } catch (e) {
+        tabsFailed.push(`${p.url}: close: ${e?.message ?? e}`)
+      }
     }
     if (!keptId) {
-      try { await browser.send('Target.createTarget', { url: HOMEPAGE }) } catch {}
+      try { await browser.send('Target.createTarget', { url: HOMEPAGE }) }
+      catch (e) { tabsFailed.push(`create blank tab: ${e?.message ?? e}`) }
     }
+    // Measured, never assumed. `pages_left` is the field a caller acts on:
+    // HOMEPAGE and about:blank are not a leak, anything else is.
+    const after = (await listTargets()).filter(t => t.type === 'page')
+    const pagesLeft = after
+      .map(t => t.url)
+      .filter(u => u && u !== HOMEPAGE && u !== 'about:blank')
     lastWipe = new Date().toISOString()
     wipedSummary = {
       cookies_seen: cookies.length,
       origins_seen: origins.length,
       origins_wiped: wipedOrigins,
       origins_failed: failedOrigins,
+      pages_after: after.length,
+      pages_left: pagesLeft,
+      tabs_failed: tabsFailed,
     }
+    completed = true
   } finally { browser.close() }
   // X selections last: clearClipboardViaCdp() needs chromium reachable, and
   // the CLIPBOARD content is the highest-value leak (a copied password
   // survived a release in the wild before this existed).
   const clipboard = await clearClipboard().catch(e => ({ error: String(e?.message ?? e) }))
-  return { wiped: true, ...wipedSummary, pages_after: 1, clipboard, at: lastWipe }
+  // `clean` is the allocator's gate on putting the pod back in the free list.
+  // `completed` guards the case where the try above bailed early and left
+  // wipedSummary at its empty defaults, which would otherwise read as clean.
+  const clean = completed &&
+                wipedSummary.origins_failed.length === 0 &&
+                wipedSummary.tabs_failed.length === 0 &&
+                wipedSummary.pages_left.length === 0
+  return { wiped: true, clean, ...wipedSummary, clipboard, at: lastWipe }
 }
 
 // --- DUMP --- //

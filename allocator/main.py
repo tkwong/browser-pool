@@ -79,6 +79,12 @@ CONTROL_SNAPSHOT_TIMEOUT = int(os.environ.get("CONTROL_SNAPSHOT_TIMEOUT_SECONDS"
 PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", "/profiles"))
 _PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 
+# Passkey store. A subdirectory of the profile PVC on purpose: the profile
+# listing globs PROFILES_DIR/*.json non-recursively, so these never show up as
+# phantom profiles. Keyed by the SAME name as a profile, so `google-tkwong`
+# means one account's cookies AND its passkeys.
+PASSKEYS_DIR = PROFILES_DIR / "passkeys"
+
 # Audit log — JSONL on the same PVC as profiles. Append-only; one record per
 # acquire / release / exhausted / wipe / inject / dump. Keeps forever; rotate
 # manually if needed.
@@ -361,6 +367,30 @@ def _profile_tar_path(name: str) -> Path:
 def _profiles_enabled() -> bool:
     try:
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception:                                                 # noqa: BLE001
+        return False
+
+
+def _passkey_path(name: str) -> Path:
+    """Where one account's WebAuthn credentials live.
+
+    A pod has no Bluetooth and no TPM, so the hybrid ("passkey from another
+    device") flow and any real platform authenticator are both impossible —
+    see memory/passkey-in-pool.md. What IS possible is a CDP virtual
+    authenticator, whose credentials export with their private key. Storing
+    them here rather than in the profile tarball is deliberate: a virtual
+    authenticator lives in the browser process, not on disk, so a profile dump
+    would never contain it.
+    """
+    if not _PROFILE_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="invalid passkey set name")
+    return PASSKEYS_DIR / f"{name}.json"
+
+
+def _passkeys_enabled() -> bool:
+    try:
+        PASSKEYS_DIR.mkdir(parents=True, exist_ok=True)
         return True
     except Exception:                                                 # noqa: BLE001
         return False
@@ -873,6 +903,87 @@ def delete_profile(name: str, authorization: Optional[str] = Header(default=None
         raise HTTPException(status_code=404, detail=f"profile not found: {name}")
     log.info("deleted profile=%s formats=%s", name, ",".join(removed))
     return {"deleted": True, "name": name, "formats": removed}
+
+
+# --------------------------------------------------------------------------- #
+# Passkeys                                                                     #
+# --------------------------------------------------------------------------- #
+# Credentials are stored verbatim in the shape CDP hands them over
+# (WebAuthn.getCredentials -> WebAuthn.addCredential), so a saved set round-trips
+# with no translation: credentialId / rpId / privateKey / userHandle / signCount,
+# all base64. privateKey is a real secret — same trust boundary as the session
+# cookies already in this PVC.
+def _passkey_summary(creds: list) -> dict:
+    rp_ids = sorted({c.get("rpId") for c in creds if isinstance(c, dict) and c.get("rpId")})
+    return {"count": len(creds), "rp_ids": rp_ids}
+
+
+@app.get("/passkeys")
+def list_passkeys(authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    if not _passkeys_enabled():
+        raise HTTPException(status_code=503, detail="passkey store unavailable")
+    items: list[dict[str, Any]] = []
+    for path in sorted(PASSKEYS_DIR.glob("*.json")):
+        try:
+            stat = path.stat()
+            creds = json.loads(path.read_text()).get("credentials", [])
+            items.append({
+                "name": path.stem,
+                **_passkey_summary(creds),
+                "size": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
+        except Exception:                                             # noqa: BLE001
+            continue
+    return {"passkeys": items}
+
+
+@app.get("/passkeys/{name}")
+def get_passkeys(name: str, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    if not _passkeys_enabled():
+        raise HTTPException(status_code=503, detail="passkey store unavailable")
+    path = _passkey_path(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"passkeys not found: {name}")
+    return json.loads(path.read_text())
+
+
+@app.put("/passkeys/{name}")
+def put_passkeys(name: str, body: dict, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    if not _passkeys_enabled():
+        raise HTTPException(status_code=503, detail="passkey store unavailable")
+    creds = body.get("credentials")
+    if not isinstance(creds, list):
+        raise HTTPException(status_code=400, detail="body.credentials must be a list")
+    for c in creds:
+        if not isinstance(c, dict) or not c.get("credentialId") or not c.get("privateKey"):
+            raise HTTPException(
+                status_code=400,
+                detail="each credential needs credentialId and privateKey (CDP WebAuthn.getCredentials shape)",
+            )
+    path = _passkey_path(name)
+    existed = path.exists()
+    path.write_text(json.dumps({"credentials": creds}, indent=2))
+    summary = _passkey_summary(creds)
+    log.info("saved passkeys=%s count=%d rps=%s replaced=%s",
+             name, summary["count"], ",".join(summary["rp_ids"]), existed)
+    return {"saved": True, "name": name, "replaced": existed, **summary}
+
+
+@app.delete("/passkeys/{name}")
+def delete_passkeys(name: str, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    if not _passkeys_enabled():
+        raise HTTPException(status_code=503, detail="passkey store unavailable")
+    path = _passkey_path(name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"passkeys not found: {name}")
+    path.unlink()
+    log.info("deleted passkeys=%s", name)
+    return {"deleted": True, "name": name}
 
 
 @app.get("/status")

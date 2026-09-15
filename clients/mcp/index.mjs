@@ -108,6 +108,7 @@ let page = null;            // currently focused Page
 let lastActivityMs = Date.now();
 let helpFlags = {};         // help_id -> { reason, started_at, condition }
 let holdUntilMs = 0;        // browser_hold: keep the lease alive until this ms
+let vauth = null;           // { id, cdp, page, name } CDP virtual authenticator
 
 const log = (msg) => console.error(`[browser-pool ${new Date().toISOString()}] ${msg}`);
 
@@ -223,6 +224,50 @@ async function allocatorProfileDelete(name) {
   return r.json();
 }
 
+async function allocatorPasskeys(path = "", init = {}) {
+  const r = await fetch(`${ALLOCATOR}/passkeys${path}`, {
+    ...init,
+    headers: { ...CF_HEADERS, ...(init.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  if (!r.ok) throw new Error(`allocator/passkeys${path} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+
+// --------------------------------------------------------------------------- //
+//  Passkeys                                                                   //
+// --------------------------------------------------------------------------- //
+// A pod has no Bluetooth adapter and no TPM, so Chrome's hybrid transport (the
+// "Use passkey from another device" QR flow, which needs BLE proximity) and any
+// real platform authenticator are both permanently out of reach. The phone's
+// own passkey cannot be moved either — its private key never leaves the secure
+// enclave. What works is a CDP virtual authenticator: to the page it is an
+// ordinary internal/platform authenticator, and its credentials export WITH the
+// private key, so a passkey enrolled once can be replayed on every later lease.
+//
+// Scoped to the page whose CDP session created it, so it must be attached
+// BEFORE the RP page calls navigator.credentials.*.
+async function attachVirtualAuthenticator() {
+  if (vauth && vauth.page === page && !page.isClosed()) return vauth;
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("WebAuthn.enable", { enableUI: false });
+  const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      ctap2Version: "ctap2_1",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      // The pod has no way to prompt for a fingerprint, so UV and presence are
+      // pre-satisfied — otherwise every ceremony would hang until it timed out.
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+    },
+  });
+  vauth = { id: authenticatorId, cdp, page, name: vauth?.name || null };
+  log(`virtual authenticator attached id=${authenticatorId}`);
+  return vauth;
+}
+
 // --------------------------------------------------------------------------- //
 //  Browser lifecycle                                                          //
 // --------------------------------------------------------------------------- //
@@ -297,6 +342,7 @@ async function teardown(reason, opts = {}) {
     await browser?.close();
   } catch {}
   browser = context = page = null;
+  vauth = null;
   const oldLease = lease;
   lease = null;
   helpFlags = {};
@@ -589,6 +635,41 @@ const TOOLS = [
       required: ["name"],
     },
   },
+  {
+    name: "browser_passkey_attach",
+    description: "Give the current tab a software passkey authenticator (CDP virtual authenticator), optionally pre-loaded with a saved passkey set. Call this BEFORE navigating to the login/registration page — a page that has already called navigator.credentials.* will not see it. This is the ONLY way passkeys work in the pool: the pods have no Bluetooth, so Chrome's 'Use passkey from another device' QR flow can never complete, and a phone's existing passkey cannot be imported (its private key never leaves the secure enclave). Typical flow: log in with password once -> browser_passkey_attach -> enrol a NEW passkey on the site -> browser_passkey_save -> every later lease just attaches with the same name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Passkey set to inject from the allocator store. Use the SAME name as the account's profile. Omit to start with an empty authenticator (for first-time enrolment)." },
+      },
+    },
+  },
+  {
+    name: "browser_passkey_save",
+    description: "Persist the credentials currently held by the attached virtual authenticator to the allocator store, so a later lease can replay them. Run this right after enrolling a passkey on a site — the authenticator lives in the browser process, so a profile save does NOT capture it and the credential is lost on release.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Name to save under (use the account's profile name)." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "browser_passkey_list",
+    description: "List saved passkey sets: {passkeys: [{name, count, rp_ids, modified}]}. rp_ids tells you which sites each set can sign in to.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "browser_passkey_delete",
+    description: "Delete a saved passkey set from the allocator store. Irreversible — the private keys are only there. Does not affect any active lease or the site-side credential.",
+    inputSchema: {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+    },
+  },
 ];
 
 // --------------------------------------------------------------------------- //
@@ -808,6 +889,7 @@ async function handleTool(name, args) {
         active_help_ids: Object.keys(helpFlags),
         holding: isHoldActive(),
         hold_seconds_remaining: isHoldActive() ? Math.round((holdUntilMs - Date.now()) / 1000) : 0,
+        passkey_authenticator: vauth ? { id: vauth.id, name: vauth.name } : null,
         // >0 means a human has the noVNC viewer open right now; -1 = unknown.
         viewers: lease ? await allocatorViewers(lease.lease_id) : 0,
       };
@@ -910,6 +992,66 @@ async function handleTool(name, args) {
     case "browser_delete_profile": {
       if (!args?.name) throw new Error("name required");
       return await allocatorProfileDelete(args.name);
+    }
+
+    case "browser_passkey_attach": {
+      await ensureBrowser();
+      const v = await attachVirtualAuthenticator();
+      let injected = 0;
+      let rpIds = [];
+      if (args?.name) {
+        const saved = await allocatorPasskeys(`/${encodeURIComponent(args.name)}`);
+        for (const c of saved.credentials || []) {
+          // getCredentials returns extra read-only fields; addCredential rejects
+          // unknown keys, so send back exactly the accepted shape.
+          await v.cdp.send("WebAuthn.addCredential", {
+            authenticatorId: v.id,
+            credential: {
+              credentialId: c.credentialId,
+              isResidentCredential: !!c.isResidentCredential,
+              rpId: c.rpId,
+              privateKey: c.privateKey,
+              ...(c.userHandle ? { userHandle: c.userHandle } : {}),
+              signCount: c.signCount || 0,
+            },
+          });
+          injected++;
+          if (c.rpId && !rpIds.includes(c.rpId)) rpIds.push(c.rpId);
+        }
+        vauth.name = args.name;
+      }
+      return {
+        attached: true,
+        authenticator_id: v.id,
+        name: args?.name || null,
+        injected,
+        rp_ids: rpIds,
+        note: "Applies to the CURRENT tab only. Attach before the page runs navigator.credentials.*.",
+      };
+    }
+
+    case "browser_passkey_save": {
+      if (!args?.name) throw new Error("name required");
+      if (!vauth) throw new Error("no virtual authenticator attached — call browser_passkey_attach first");
+      const { credentials } = await vauth.cdp.send("WebAuthn.getCredentials", { authenticatorId: vauth.id });
+      if (!credentials?.length) {
+        throw new Error("authenticator holds no credentials — enrol a passkey on the site first");
+      }
+      const saved = await allocatorPasskeys(`/${encodeURIComponent(args.name)}`, {
+        method: "PUT",
+        body: JSON.stringify({ credentials }),
+      });
+      vauth.name = args.name;
+      return saved;
+    }
+
+    case "browser_passkey_list": {
+      return await allocatorPasskeys();
+    }
+
+    case "browser_passkey_delete": {
+      if (!args?.name) throw new Error("name required");
+      return await allocatorPasskeys(`/${encodeURIComponent(args.name)}`, { method: "DELETE" });
     }
 
     default:

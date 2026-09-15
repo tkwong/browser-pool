@@ -8,6 +8,10 @@
  *   - MCP startup: NO pod acquired (lazy).
  *   - First `browser_*` tool call: POST allocator/acquire -> Playwright
  *     connectOverCDP -> ready.
+ *   - CDP transport dies under a live lease (tunnel blip): the next
+ *     `browser_*` call re-dials the SAME pod and restores the tab it was on.
+ *     The pod, its profile and every open page survive; only our socket was
+ *     lost. Falls back to a fresh pod only if the lease is gone server-side.
  *   - Idle for BROWSER_POOL_IDLE_RELEASE_MS (default 25 min): auto-release.
  *     PAUSED while a user-help session is open or a browser_hold is active.
  *   - Heartbeat: while a lease is held, POST allocator/extend keeps the
@@ -178,10 +182,16 @@ async function allocatorViewers(leaseId) {
   }
 }
 
-// Heartbeat: push the lease's server-side deadline out. Every failure mode
-// returns null and is survivable — the allocator TTL remains the backstop, so a
-// hiccup here can only shorten a session, never strand a pod. A 404 also covers
-// an older allocator that has no /extend route at all.
+// Heartbeat: push the lease's server-side deadline out. Every failure mode is
+// survivable — the allocator TTL remains the backstop, so a hiccup here can only
+// shorten a session, never strand a pod.
+//
+// Returns {gone:true} for the one answer a caller must not treat as a hiccup:
+// the allocator saying `lease_not_found`, i.e. the pod was reaped or handed to
+// someone else. Anything else (409 max_session, an unreachable allocator, an
+// older allocator with no /extend route at all — which 404s with FastAPI's
+// generic "Not Found") returns null and means "assume the lease is still ours".
+// Getting this backwards would let a reconnect dial into a stranger's session.
 async function allocatorExtend(leaseId, ttl = HEARTBEAT_TTL) {
   try {
     const r = await fetch(`${ALLOCATOR}/extend`, {
@@ -190,6 +200,7 @@ async function allocatorExtend(leaseId, ttl = HEARTBEAT_TTL) {
       body: JSON.stringify({ lease_id: leaseId, ttl }),
     });
     const j = await r.json().catch(() => ({}));
+    if (r.status === 404) return { gone: j?.detail === "lease_not_found" };
     if (r.status === 409) {
       log(`extend refused (${j?.detail?.error || "max_session_exceeded"}) — lease will expire on schedule`);
       return null;
@@ -276,20 +287,87 @@ async function attachVirtualAuthenticator() {
 // browser_load_profile is called, we teardown+re-acquire to apply the change.
 let pendingProfile = null;
 
+// page.url() reads cached state, but a handle whose transport died can still
+// throw. The URL is only a hint for re-focusing the right tab, so a failure here
+// must never be the thing that costs us a reconnect.
+function currentUrl() {
+  try {
+    return page?.url() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Dial a pod's CDP endpoint and adopt its context + page. `wantUrl` is the tab
+// we were on before, so a reconnect lands back where we left off rather than on
+// whichever target happens to be first (a pod mid-session usually also has an
+// idle about:blank, and picking that one looks exactly like a lost session).
+//
+// Pass CF Access headers — when cdp_url is a CF Tunnel hostname, the WS upgrade
+// needs the same auth as the REST allocator. (No effect when the operator's
+// NodePort URL is used inside the tailnet.)
+async function connectTo(cdpUrl, wantUrl = null) {
+  browser = await chromium.connectOverCDP(cdpUrl, { headers: CF_HEADERS });
+  context = browser.contexts()[0] || (await browser.newContext());
+  const pages = context.pages();
+  page =
+    (wantUrl && pages.find((p) => p.url() === wantUrl)) ||
+    pages.find((p) => p.url() !== "about:blank") ||
+    pages[0] ||
+    (await context.newPage());
+}
+
 async function ensureBrowser() {
   lastActivityMs = Date.now();
-  if (browser) return;
+  if (browser?.isConnected()) return;
+
+  // A dead transport over a live lease. connectOverCDP has no reconnect of its
+  // own and a Browser handle stays truthy after its socket dies, so the old
+  // `if (browser) return` handed every later call a zombie for the rest of the
+  // process's life. On 2026-09-15 a CF Tunnel blip killed CDP mid-login while
+  // the pod, the viewer and the half-finished form were all still fine, and the
+  // only way back was for the operator to finish by hand.
+  //
+  // Re-dial the SAME pod: acquiring a new one wipes the profile, which is the
+  // session we are trying to rescue. A pending profile switch is the one case
+  // that genuinely wants a fresh pod, so it skips this.
+  if (browser && lease && !pendingProfile) {
+    const wantUrl = currentUrl();
+    // Deliberately NOT browser.close(): on a CDP-connected browser that kills
+    // the remote Chromium — precisely what we are saving. The old handle's
+    // transport is already dead, so just drop it.
+    browser = context = page = null;
+    const check = await allocatorExtend(lease.lease_id);
+    if (check?.gone) {
+      log(`lease=${lease.lease_id} no longer held server-side — cannot reconnect, acquiring a fresh pod`);
+      lease = null;
+    } else {
+      try {
+        await connectTo(lease.cdp_url, wantUrl);
+        if (vauth) {
+          log("virtual authenticator did not survive the old CDP session — re-attach with browser_passkey_attach before the next passkey prompt");
+        }
+        vauth = null;
+        log(`reconnected pod=${lease.pod} lease=${lease.lease_id} url=${page.url()}`);
+        return;
+      } catch (e) {
+        // Lease is ours but unreachable. Hand it back rather than orphaning a
+        // pod against the per-token quota; a viewer-held pod refuses, which is
+        // the right answer — someone is still using it.
+        log(`reconnect to pod=${lease.pod} failed: ${e.message} — releasing it and acquiring a fresh pod`);
+        const deadId = lease.lease_id;
+        lease = null;
+        allocatorRelease(deadId).catch(() => {});
+      }
+    }
+  }
+
   const useProfile = pendingProfile;
   pendingProfile = null;
   lease = await allocatorAcquire(useProfile);
   log(`acquired pod=${lease.pod} cdp=${lease.cdp_url} view=${lease.view_url}` +
       (lease.profile_injected ? ` profile=${useProfile} (${lease.profile_injected.cookies}c/${lease.profile_injected.origins}o)` : ""));
-  // Pass CF Access headers — when cdp_url is a CF Tunnel hostname, the WS
-  // upgrade needs the same auth as the REST allocator. (No effect when the
-  // operator's NodePort URL is used inside the tailnet.)
-  browser = await chromium.connectOverCDP(lease.cdp_url, { headers: CF_HEADERS });
-  context = browser.contexts()[0] || (await browser.newContext());
-  page = context.pages()[0] || (await context.newPage());
+  await connectTo(lease.cdp_url);
 }
 
 // Refuse to tear down a session a human is in the middle of. Two independent

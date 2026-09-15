@@ -235,6 +235,15 @@ async function allocatorProfileDelete(name) {
   return r.json();
 }
 
+async function allocatorTrash(path = "", init = {}) {
+  const r = await fetch(`${ALLOCATOR}/trash${path}`, {
+    ...init,
+    headers: { ...CF_HEADERS, ...(init.body ? { "Content-Type": "application/json" } : {}) },
+  });
+  if (!r.ok) throw new Error(`allocator/trash${path} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  return r.json();
+}
+
 async function allocatorPasskeys(path = "", init = {}) {
   const r = await fetch(`${ALLOCATOR}/passkeys${path}`, {
     ...init,
@@ -714,6 +723,23 @@ const TOOLS = [
     },
   },
   {
+    name: "browser_list_trash",
+    description: "List profiles the allocator binned on recent releases and lease expiries. Every release and every TTL expiry snapshots the pod's profile here before wiping it, so a session you forgot to save with browser_release {save_as} is still recoverable for a short grace period (default 30 min). Returns {trash: [{id, pod, reason, size, age_s, expires_in_s, urls}], ttl_seconds, enabled}. Use `urls` (the last tabs that were open) to tell two entries apart, then browser_recover_profile to promote one to a named profile.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "browser_recover_profile",
+    description: "Promote a binned profile from the trash into a permanent named profile — the rescue for a login you forgot to save. Pass the `id` from browser_list_trash and the `name` to save it as; browser_load_profile can then use it like any other profile. Entries expire, so recover before `expires_in_s` runs out. Does not touch any active lease.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Trash entry id from browser_list_trash" },
+        name: { type: "string", description: "Profile name to save it as (overwrites an existing profile of that name)" },
+      },
+      required: ["id", "name"],
+    },
+  },
+  {
     name: "browser_passkey_attach",
     description: "Give the current tab a software passkey authenticator (CDP virtual authenticator), optionally pre-loaded with a saved passkey set. Call this BEFORE navigating to the login/registration page — a page that has already called navigator.credentials.* will not see it. This is the ONLY way passkeys work in the pool: the pods have no Bluetooth, so Chrome's 'Use passkey from another device' QR flow can never complete, and a phone's existing passkey cannot be imported (its private key never leaves the secure enclave). Typical flow: log in with password once -> browser_passkey_attach -> enrol a NEW passkey on the site -> browser_passkey_save -> every later lease just attaches with the same name.",
     inputSchema: {
@@ -1070,6 +1096,19 @@ async function handleTool(name, args) {
     case "browser_delete_profile": {
       if (!args?.name) throw new Error("name required");
       return await allocatorProfileDelete(args.name);
+    }
+
+    case "browser_list_trash": {
+      return await allocatorTrash();
+    }
+
+    case "browser_recover_profile": {
+      if (!args?.id) throw new Error("id required (from browser_list_trash)");
+      if (!args?.name) throw new Error("name required (what to save it as)");
+      return await allocatorTrash(`/${encodeURIComponent(args.id)}/restore`, {
+        method: "POST",
+        body: JSON.stringify({ name: args.name }),
+      });
     }
 
     case "browser_passkey_attach": {

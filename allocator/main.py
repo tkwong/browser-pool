@@ -85,6 +85,22 @@ _PROFILE_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,64}$")
 # means one account's cookies AND its passkeys.
 PASSKEYS_DIR = PROFILES_DIR / "passkeys"
 
+# Profile trash — a grace period before a wiped profile is gone for good.
+# /release and the TTL reaper both wipe the pod, which is right (the next
+# leaseholder must never inherit a login) but unforgiving: forget `save_as` and
+# the session is unrecoverable. So both paths bin a full snapshot here first and
+# a GC thread deletes it after TRASH_TTL_SECONDS. The pod is still wiped
+# immediately — this buys the OPERATOR a window to promote a forgotten session
+# into a named profile, it does not leave anything behind on the pod.
+# TRASH_TTL_SECONDS=0 disables the feature entirely.
+TRASH_DIR = PROFILES_DIR / "trash"
+TRASH_TTL = int(os.environ.get("TRASH_TTL_SECONDS", "1800"))          # 30 min
+TRASH_GC_INTERVAL = int(os.environ.get("TRASH_GC_INTERVAL_SECONDS", "120"))
+# Second bound, so a burst of short leases cannot fill the PVC even inside the
+# TTL window. Oldest entries go first.
+TRASH_MAX_ENTRIES = int(os.environ.get("TRASH_MAX_ENTRIES", "200"))
+_TRASH_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[a-zA-Z0-9._-]{1,64}-[a-zA-Z0-9]{1,32}$")
+
 # Audit log — JSONL on the same PVC as profiles. Append-only; one record per
 # acquire / release / exhausted / wipe / inject / dump. Keeps forever; rotate
 # manually if needed.
@@ -128,6 +144,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 _lock = threading.Lock()
 _state: dict[str, Optional[dict]] = {pod: None for pod in POOL}   # pod -> None or {lease_id, expires_at, leased_at, qt_proc, view_url}
 _lease_to_pod: dict[str, str] = {}
+# Pods whose lease is gone but whose profile is still on disk. Both teardown
+# paths mark the pod free under the lock and only THEN do their (slow, network)
+# save/snapshot/wipe off-lock — a snapshot stops Chromium and waits for s6, so
+# that gap is up to CONTROL_SNAPSHOT_TIMEOUT wide. Acquire must not hand out a
+# pod inside it or the next leaseholder inherits the last one's login.
+_reaping: set[str] = set()
 
 
 # --------------------------------------------------------------------------- #
@@ -460,6 +482,143 @@ def _wipe_pod_profile(pod: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Profile trash                                                                #
+# --------------------------------------------------------------------------- #
+def _trash_enabled() -> bool:
+    if TRASH_TTL <= 0:
+        return False
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:                                            # noqa: BLE001
+        log.warning("trash dir unavailable (%s) — nothing will be binned", e)
+        return False
+
+
+def _trash_tar_path(entry_id: str) -> Path:
+    if not _TRASH_ID_RE.match(entry_id):
+        raise HTTPException(status_code=400, detail="invalid trash id")
+    return TRASH_DIR / f"{entry_id}.tar.gz"
+
+
+def _trash_meta_path(entry_id: str) -> Path:
+    if not _TRASH_ID_RE.match(entry_id):
+        raise HTTPException(status_code=400, detail="invalid trash id")
+    return TRASH_DIR / f"{entry_id}.meta.json"
+
+
+def _bin_profile_before_wipe(pod: str, lease_id: str, reason: str,
+                             tabs: Optional[list] = None,
+                             quota_key: str = "anonymous") -> Optional[str]:
+    """Snapshot the pod's profile into the trash so the caller can wipe freely.
+
+    Best-effort in exactly the way `save_as` is: a sidecar that is slow, down or
+    returns nothing must NEVER stop the wipe, because a profile that survives on
+    the pod leaks a login to the next leaseholder. Returns the entry id or None.
+    """
+    if not _trash_enabled():
+        return None
+    entry_id = "%s-%s-%s" % (_now().strftime("%Y%m%dT%H%M%SZ"), pod,
+                             (lease_id or "unknown")[:8])
+    try:
+        blob, meta = _snapshot_profile_from_pod(pod)
+        _trash_tar_path(entry_id).write_bytes(blob)
+        _trash_meta_path(entry_id).write_text(json.dumps({
+            "id": entry_id,
+            "pod": pod,
+            "lease_id": lease_id,
+            "reason": reason,
+            "quota_key": quota_key,
+            "binned_at": _now().isoformat(),
+            "size": len(blob),
+            "sha256": meta.get("sha256"),
+            # The only field that lets a human tell two anonymous tarballs apart.
+            "tabs": [{"url": t.get("url"), "title": t.get("title")}
+                     for t in (tabs or [])[:10] if isinstance(t, dict)],
+        }, indent=2))
+        log.info("binned profile pod=%s lease=%s reason=%s bytes=%d id=%s",
+                 pod, lease_id, reason, len(blob), entry_id)
+        return entry_id
+    except Exception as e:                                            # noqa: BLE001
+        log.warning("trash snapshot pod=%s lease=%s failed (wipe continues): %s",
+                    pod, lease_id, e)
+        return None
+
+
+def _trash_entries() -> list[dict]:
+    """Newest first. A tarball whose meta is missing or corrupt still lists —
+    losing the metadata must not hide a recoverable login."""
+    items: list[dict[str, Any]] = []
+    if not TRASH_DIR.is_dir():
+        return items
+    now = time.time()
+    for path in TRASH_DIR.glob("*.tar.gz"):
+        entry_id = path.name[: -len(".tar.gz")]
+        try:
+            stat = path.stat()
+        except Exception:                                             # noqa: BLE001
+            continue
+        meta: dict[str, Any] = {}
+        meta_path = TRASH_DIR / f"{entry_id}.meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:                                         # noqa: BLE001
+                meta = {}
+        age = max(0, int(now - stat.st_mtime))
+        tabs = meta.get("tabs") or []
+        items.append({
+            "id": entry_id,
+            "pod": meta.get("pod"),
+            "lease_id": meta.get("lease_id"),
+            "reason": meta.get("reason"),
+            "quota_key": meta.get("quota_key"),
+            "size": stat.st_size,
+            "binned_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            "age_s": age,
+            "expires_in_s": max(0, TRASH_TTL - age) if TRASH_TTL > 0 else None,
+            "urls": [t.get("url") for t in tabs
+                     if isinstance(t, dict) and t.get("url")][:5],
+        })
+    items.sort(key=lambda i: i["binned_at"], reverse=True)
+    return items
+
+
+def _trash_gc_once() -> int:
+    """Delete entries past TRASH_TTL, then trim the survivors to
+    TRASH_MAX_ENTRIES (oldest first). Returns how many entries went."""
+    entries = _trash_entries()                      # newest first
+    doomed = [e["id"] for e in entries if TRASH_TTL > 0 and e["age_s"] > TRASH_TTL]
+    doomed_set = set(doomed)
+    survivors = [e["id"] for e in entries if e["id"] not in doomed_set]
+    if TRASH_MAX_ENTRIES > 0 and len(survivors) > TRASH_MAX_ENTRIES:
+        doomed.extend(survivors[TRASH_MAX_ENTRIES:])
+    for entry_id in doomed:
+        for path in (TRASH_DIR / f"{entry_id}.tar.gz",
+                     TRASH_DIR / f"{entry_id}.meta.json"):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as e:                                    # noqa: BLE001
+                log.warning("trash gc could not unlink %s: %s", path, e)
+    if doomed:
+        log.info("trash gc removed=%d remaining=%d", len(doomed),
+                 len(entries) - len(doomed))
+    return len(doomed)
+
+
+def _trash_gc() -> None:
+    while True:
+        time.sleep(TRASH_GC_INTERVAL)
+        if TRASH_TTL <= 0:
+            continue
+        try:
+            _trash_gc_once()
+        except Exception as e:                                        # noqa: BLE001
+            log.warning("trash gc pass failed: %s", e)
+
+
+# --------------------------------------------------------------------------- #
 # Schemas                                                                     #
 # --------------------------------------------------------------------------- #
 class AcquireReq(BaseModel):
@@ -547,7 +706,7 @@ def acquire(
                     },
                 )
         for pod in POOL:
-            if _state[pod] is None:
+            if _state[pod] is None and pod not in _reaping:
                 if not _cdp_healthy(pod):
                     log.warning("acquire: skip pod=%s — CDP unhealthy (wedged/OOM); leaving for liveness probe to recycle", pod)
                     continue
@@ -682,53 +841,74 @@ def release(
             raise HTTPException(status_code=404, detail="lease_not_found")
         old_state = _state[pod]
         _state[pod] = None
+        # Hold the pod out of the free list until its profile is really gone:
+        # everything below is off-lock and a snapshot can take a Chromium
+        # restart, so without this acquire could hand the pod to someone else
+        # while the last session's login is still on disk.
+        _reaping.add(pod)
 
     saved_to: Optional[str] = None
     saved_format: Optional[str] = None
-    # Order: save_as BEFORE wipe (else there's nothing to dump).
-    if req.save_as:
-        if not _profiles_enabled():
-            log.warning("save_as requested but PROFILES_DIR unavailable; skipped")
-        else:
-            try:
-                if req.save_domain_filter:
-                    # Domain filtering only exists in the CDP dump — a profile
-                    # tarball is all-or-nothing on disk. Caller opted into the
-                    # narrower format, so IndexedDB is not captured.
-                    profile = _dump_profile_from_pod(pod, req.save_domain_filter)
-                    path = _profile_path(req.save_as)
-                    path.write_text(json.dumps(profile, indent=2))
-                    saved_to = str(path)
-                    saved_format = "json"   # narrower: no IndexedDB
-                    log.info("saved profile=%s pod=%s format=json cookies=%d origins=%d → %s",
-                             req.save_as, pod, len(profile.get("cookies", [])),
-                             len(profile.get("origins", [])), path)
-                else:
-                    blob, meta = _snapshot_profile_from_pod(pod, req.save_service_worker)
-                    path = _profile_tar_path(req.save_as)
-                    path.write_bytes(blob)
-                    saved_to = str(path)
-                    saved_format = "tar"
-                    # Drop a stale JSON of the same name so acquire's
-                    # tar-then-json fallback can never serve the older, thinner
-                    # copy if the tarball is later removed by hand.
-                    stale = _profile_path(req.save_as)
-                    if stale.exists():
-                        stale.unlink()
-                        log.info("removed superseded json profile=%s", req.save_as)
-                    log.info("saved profile=%s pod=%s format=tar bytes=%d sha256=%s paths=%d → %s",
-                             req.save_as, pod, len(blob), meta.get("sha256", "?")[:12],
-                             len(meta.get("paths", [])), path)
-            except HTTPException:
-                raise
-            except Exception as e:                                    # noqa: BLE001
-                log.error("save_as=%s pod=%s failed: %s — wipe still proceeds", req.save_as, pod, e)
+    trashed: Optional[str] = None
+    tabs: list = []
+    try:
+        # Order: save_as BEFORE wipe (else there's nothing to dump).
+        if req.save_as:
+            if not _profiles_enabled():
+                log.warning("save_as requested but PROFILES_DIR unavailable; skipped")
+            else:
+                try:
+                    if req.save_domain_filter:
+                        # Domain filtering only exists in the CDP dump — a profile
+                        # tarball is all-or-nothing on disk. Caller opted into the
+                        # narrower format, so IndexedDB is not captured.
+                        profile = _dump_profile_from_pod(pod, req.save_domain_filter)
+                        path = _profile_path(req.save_as)
+                        path.write_text(json.dumps(profile, indent=2))
+                        saved_to = str(path)
+                        saved_format = "json"   # narrower: no IndexedDB
+                        log.info("saved profile=%s pod=%s format=json cookies=%d origins=%d → %s",
+                                 req.save_as, pod, len(profile.get("cookies", [])),
+                                 len(profile.get("origins", [])), path)
+                    else:
+                        blob, meta = _snapshot_profile_from_pod(pod, req.save_service_worker)
+                        path = _profile_tar_path(req.save_as)
+                        path.write_bytes(blob)
+                        saved_to = str(path)
+                        saved_format = "tar"
+                        # Drop a stale JSON of the same name so acquire's
+                        # tar-then-json fallback can never serve the older, thinner
+                        # copy if the tarball is later removed by hand.
+                        stale = _profile_path(req.save_as)
+                        if stale.exists():
+                            stale.unlink()
+                            log.info("removed superseded json profile=%s", req.save_as)
+                        log.info("saved profile=%s pod=%s format=tar bytes=%d sha256=%s paths=%d → %s",
+                                 req.save_as, pod, len(blob), meta.get("sha256", "?")[:12],
+                                 len(meta.get("paths", [])), path)
+                except HTTPException:
+                    raise
+                except Exception as e:                                    # noqa: BLE001
+                    log.error("save_as=%s pod=%s failed: %s — wipe still proceeds", req.save_as, pod, e)
 
-    # Snapshot tabs + nav history BEFORE wipe (wipe navigates tabs to about:blank).
-    tabs = _sidecar_tabs(pod)
-    if old_state:
-        _kill_quick_tunnel(old_state)
-    _wipe_pod_profile(pod)
+        # Snapshot tabs + nav history BEFORE wipe (wipe navigates tabs to about:blank).
+        tabs = _sidecar_tabs(pod)
+        # Forgot save_as? The profile goes to the trash instead of nowhere. Skipped
+        # when a full tarball was just saved: /snapshot stops Chromium and waits for
+        # s6 to relaunch it, so a second pass would cost another restart for a copy
+        # the caller already has.
+        trashed = None
+        if saved_format != "tar":
+            trashed = _bin_profile_before_wipe(
+                pod, req.lease_id, "release", tabs,
+                (old_state or {}).get("quota_key", "anonymous"))
+        if old_state:
+            _kill_quick_tunnel(old_state)
+        _wipe_pod_profile(pod)
+    finally:
+        with _lock:
+            _reaping.discard(pod)
+
     duration = None
     if old_state and old_state.get("leased_at"):
         duration = int((_now() - old_state["leased_at"]).total_seconds())
@@ -737,13 +917,14 @@ def release(
                       else (old_state or {}).get("quota_key", "anonymous")),
            source_ip=rel_source_ip,
            save_as=req.save_as, duration_s=duration, tabs=tabs,
-           forced=req.force or None)
+           forced=req.force or None, trashed=trashed)
     log.info("released pod=%s lease=%s save_as=%s", pod, req.lease_id, req.save_as or "(none)")
     # saved_format is returned so a caller can see it got the thin JSON dump
     # (save_domain_filter) instead of the full tarball, rather than finding out
     # later when the restored profile is missing IndexedDB.
     return {"released": True, "pod": pod, "saved_to": saved_to,
-            "saved_format": saved_format}
+            "saved_format": saved_format, "trashed": trashed,
+            "trash_ttl_seconds": TRASH_TTL if trashed else None}
 
 
 @app.post("/extend")
@@ -905,6 +1086,63 @@ def delete_profile(name: str, authorization: Optional[str] = Header(default=None
     return {"deleted": True, "name": name, "formats": removed}
 
 
+@app.get("/trash")
+def list_trash(authorization: Optional[str] = Header(default=None)):
+    """Profiles binned on the last few releases/expiries, newest first."""
+    _check_auth(authorization)
+    return {
+        "trash": _trash_entries(),
+        "enabled": TRASH_TTL > 0,
+        "ttl_seconds": TRASH_TTL,
+        "max_entries": TRASH_MAX_ENTRIES,
+    }
+
+
+@app.post("/trash/{entry_id}/restore")
+def restore_trash(entry_id: str, body: dict,
+                  authorization: Optional[str] = Header(default=None)):
+    """Promote a binned profile to a named one — the forgotten-save_as rescue."""
+    _check_auth(authorization)
+    if not _profiles_enabled():
+        raise HTTPException(status_code=503, detail="profiles store unavailable")
+    name = (body or {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise HTTPException(status_code=400,
+                            detail="body.name (target profile name) is required")
+    src = _trash_tar_path(entry_id)
+    if not src.exists():
+        raise HTTPException(status_code=404, detail=f"trash entry not found: {entry_id}")
+    dest = _profile_tar_path(name)              # validates the name
+    replaced = dest.exists()
+    shutil.copyfile(src, dest)
+    # Same reason as save_as: a stale JSON of the same name would otherwise win
+    # acquire's tar-then-json fallback if the tarball is later removed by hand.
+    stale = _profile_path(name)
+    if stale.exists():
+        stale.unlink()
+    size = dest.stat().st_size
+    log.info("restored trash=%s -> profile=%s bytes=%d replaced=%s",
+             entry_id, name, size, replaced)
+    _audit("trash_restore", trash_id=entry_id, name=name, replaced=replaced, size=size)
+    return {"restored": True, "id": entry_id, "name": name, "format": "tar",
+            "replaced": replaced, "size": size}
+
+
+@app.delete("/trash/{entry_id}")
+def delete_trash(entry_id: str, authorization: Optional[str] = Header(default=None)):
+    """Purge one entry now instead of waiting out the TTL."""
+    _check_auth(authorization)
+    src = _trash_tar_path(entry_id)
+    if not src.exists():
+        raise HTTPException(status_code=404, detail=f"trash entry not found: {entry_id}")
+    src.unlink()
+    meta = _trash_meta_path(entry_id)
+    if meta.exists():
+        meta.unlink()
+    log.info("purged trash=%s", entry_id)
+    return {"deleted": True, "id": entry_id}
+
+
 # --------------------------------------------------------------------------- #
 # Passkeys                                                                     #
 # --------------------------------------------------------------------------- #
@@ -993,7 +1231,10 @@ def status():
         free = 0
         for pod, st in _state.items():
             if st is None:
-                free += 1
+                # A pod mid-teardown is not free yet — counting it as such is
+                # how a caller concludes the pool has capacity it does not have.
+                if pod not in _reaping:
+                    free += 1
             else:
                 leased.append(
                     {
@@ -1004,7 +1245,8 @@ def status():
                         "view_url": st.get("view_url"),
                     }
                 )
-        return {"pool_size": len(POOL), "free": free, "leased": leased}
+        return {"pool_size": len(POOL), "free": free, "leased": leased,
+                "reaping": sorted(_reaping)}
 
 
 @app.get("/healthz")
@@ -1099,12 +1341,14 @@ def admin_status(authorization: Optional[str] = Header(default=None)):
     _check_auth(authorization)
     with _lock:
         snap = {pod: (st.copy() if st else None) for pod, st in _state.items()}
+        reaping = set(_reaping)          # same instant as snap, else the two disagree
     pods = []
     for pod, st in snap.items():
         side = _sidecar_status(pod)
         if st is None:
             pods.append({
-                "pod": pod, "free": True,
+                "pod": pod, "free": pod not in reaping,
+                "reaping": pod in reaping or None,
                 "chromium": side,
             })
         else:
@@ -1511,17 +1755,28 @@ def _reaper() -> None:
                 log.info("expiring lease pod=%s lease=%s", pod, st["lease_id"])
                 _lease_to_pod.pop(st["lease_id"], None)
                 _state[pod] = None
+                _reaping.add(pod)      # unacquirable until the wipe below lands
                 expired.append((pod, st))
         for pod, st in expired:
-            tabs = _sidecar_tabs(pod)               # before wipe
-            _kill_quick_tunnel(st)
-            _wipe_pod_profile(pod)
+            try:
+                tabs = _sidecar_tabs(pod)           # before wipe
+                # The reaper has no save_as at all, so this path is the only
+                # chance an idle-reaped or expired session ever gets.
+                trashed = _bin_profile_before_wipe(
+                    pod, st["lease_id"], "expire", tabs,
+                    st.get("quota_key", "anonymous"))
+                _kill_quick_tunnel(st)
+                _wipe_pod_profile(pod)
+            finally:
+                with _lock:
+                    _reaping.discard(pod)
             duration = int((_now() - st["leased_at"]).total_seconds()) if st.get("leased_at") else None
             _audit("expire", lease_id=st["lease_id"], pod=pod,
                    quota_key=st.get("quota_key", "anonymous"),
                    source_ip=st.get("source_ip", "unknown"),
-                   duration_s=duration, tabs=tabs,
+                   duration_s=duration, tabs=tabs, trashed=trashed,
                    extends=st.get("extends", 0), viewer_held=st.get("viewer_held", 0))
 
 
 threading.Thread(target=_reaper, daemon=True, name="reaper").start()
+threading.Thread(target=_trash_gc, daemon=True, name="trash-gc").start()

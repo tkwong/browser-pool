@@ -92,6 +92,13 @@ spec:
             - { name: REAPER_INTERVAL_SECONDS,  value: "10" }
             - { name: PROFILES_DIR,             value: "/profiles" }
             - { name: MAX_LEASES_PER_TOKEN,     value: "3" }   # per-CF-Access-Client-Id concurrent cap; 429 over. 3 keeps fairness headroom on a 6-pod pool (two tokens × 3 = 6).
+            # Profile trash: /release and the TTL reaper bin a snapshot under
+            # /profiles/trash before they wipe, so a session released without
+            # `save_as` is still recoverable for this long. The pod is wiped
+            # immediately either way — this only buys the operator a window.
+            # Set TRASH_TTL_SECONDS=0 to turn the whole thing off.
+            - { name: TRASH_TTL_SECONDS,        value: "1800" }   # 30 min
+            - { name: TRASH_MAX_ENTRIES,        value: "200" }    # PVC guard: a burst of short leases must not fill /profiles
           envFrom:
             - secretRef: { name: allocator-secrets, optional: true }
           ports:

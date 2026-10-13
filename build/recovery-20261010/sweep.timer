@@ -1,0 +1,10 @@
+[Unit]
+Description=Run browser-pool shm orphan sweep every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=sweep-orphans.service
+
+[Install]
+WantedBy=timers.target

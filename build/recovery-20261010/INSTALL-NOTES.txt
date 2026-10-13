@@ -1,0 +1,52 @@
+Sweep stopgap (#2) + shmem alert (#4) — INSTALLED on VM100 2026-10-13 (GO inbound5558)
+
+Files (staged here, installed to the paths below)
+  sweep-orphans.sh  -> /usr/local/bin/bp-sweep-orphans   (755)
+  sweep.service     -> /etc/systemd/system/sweep-orphans.service   (644)
+  sweep.timer       -> /etc/systemd/system/sweep-orphans.timer     (644)
+  check-shmem.sh    -> /usr/local/bin/bp-check-shmem     (755)
+  check-shmem.service -> /etc/systemd/system/check-shmem.service   (644)
+  check-shmem.timer   -> /etc/systemd/system/check-shmem.timer     (644)
+
+Install (on VM100, 192.168.68.61 as of 2026-10-13; DHCP — re-read from `qm list`/guest, do not trust .50)
+  sudo install -m755 sweep-orphans.sh   /usr/local/bin/bp-sweep-orphans
+  sudo install -m644 sweep.service      /etc/systemd/system/sweep-orphans.service
+  sudo install -m644 sweep.timer        /etc/systemd/system/sweep-orphans.timer
+  sudo install -m755 check-shmem.sh     /usr/local/bin/bp-check-shmem
+  sudo install -m644 check-shmem.service /etc/systemd/system/check-shmem.service
+  sudo install -m644 check-shmem.timer   /etc/systemd/system/check-shmem.timer
+  sudo systemd-analyze verify sweep-orphans.{service,timer} check-shmem.{service,timer}
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now sweep-orphans.timer check-shmem.timer
+
+Cadence
+  sweep-orphans : OnBootSec=3min + every 5 min, oneshot
+  check-shmem   : OnBootSec=5min + every 15 min, oneshot
+
+What they do
+  * sweep: inside each chrome-vnc-* pod's IPC ns, `ipcrm -m <shmid>` for segments
+    whose /proc/sysvipc/shm field 6 (nattch) == 0, i.e. nothing is attached. The live
+    Xvfb framebuffer (nattch==1, 530,844,832 B) is never touched. No restart, no
+    config change, no image change.
+  * check: sums shmem in /sys/fs/cgroup/kubepods.slice/memory.stat. > THRESHOLD_MIB
+    (default 8192) logs `SHMEM_ALERT ...` and exits 2, so the unit lands in
+    `systemctl --failed`. Also exits 1 if memory.stat is unreadable. Baseline on a
+    healthy pool is ~506 MiB/pod (one live framebuffer each) ~= 3.0 GiB aggregate.
+    Note `pods=` in the output counts ALL pod slices, not just chrome-vnc-*.
+
+Verify
+  systemctl list-timers sweep-orphans.timer check-shmem.timer
+  sudo journalctl -u sweep-orphans -u check-shmem --since '20 min ago'
+  # expect: orphans_removed=N ... and shmem_ok kubepods_shmem=~3038MiB
+  THRESHOLD_MIB=2048 /usr/local/bin/bp-check-shmem ; echo $?   # 2 = alert path works
+
+Rollback
+  sudo systemctl disable --now sweep-orphans.timer check-shmem.timer
+  sudo rm /etc/systemd/system/sweep-orphans.{service,timer} \
+          /etc/systemd/system/check-shmem.{service,timer} \
+          /usr/local/bin/bp-sweep-orphans /usr/local/bin/bp-check-shmem
+  sudo systemctl daemon-reload
+
+NOT included (still needs its own GO — reliability-core / image change)
+  * trap + IPC_RMID in the pod entrypoint (the real fix)
+  * shrinking the 15360x8640 framebuffer (530,841,600 B = 506.25 MiB per orphan)

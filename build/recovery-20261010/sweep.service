@@ -1,0 +1,7 @@
+[Unit]
+Description=Sweep orphaned SysV shm segments in browser-pool pods
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bp-sweep-orphans

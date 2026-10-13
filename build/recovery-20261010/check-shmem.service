@@ -1,0 +1,7 @@
+[Unit]
+Description=Alert when browser-pool pods' cgroup shmem exceeds the ceiling
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bp-check-shmem

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check browser-pool shmem ceiling every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=check-shmem.service
+
+[Install]
+WantedBy=timers.target

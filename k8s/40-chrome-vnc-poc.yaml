@@ -23,6 +23,33 @@ data:
       "RestoreOnStartupURLs": []
     }
 ---
+# linuxserver custom-init hook: every executable in /custom-cont-init.d runs as
+# root at container start, BEFORE svc-xorg launches Xvfb.
+#
+# Why: Xvfb -shmem allocates its framebuffer as a SysV shm segment and never
+# marks it IPC_RMID. The segment belongs to the POD's IPC namespace (held by the
+# pause container), not the chromium container — so every container restart
+# (liveness kill, OOM) left the old framebuffer behind with nattch==0, and they
+# stacked until kubepods shmem ran the VM out of RAM (2026-10-10 outage).
+# At this point in init no Xvfb is attached to anything, so any nattch==0
+# segment in this pod is by definition an orphan. The host-side
+# bp-sweep-orphans timer stays as a backstop for orphans made mid-life.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chrome-vnc-custom-init
+  namespace: browser-pool
+data:
+  10-sweep-orphan-shm: |
+    #!/bin/bash
+    # /proc/sysvipc/shm columns: key shmid perms size cpid lpid nattch ...
+    removed=0
+    for id in $(awk 'NR>1 && $7==0 {print $2}' /proc/sysvipc/shm); do
+      if ipcrm -m "$id"; then removed=$((removed+1)); fi
+    done
+    echo "[sweep-orphan-shm] removed=${removed}"
+    exit 0
+---
 # Control sidecar source — scripts/control-sidecar.mjs is the source of
 # truth; Makefile awk template inlines it at apply time at the marker below.
 apiVersion: v1
@@ -216,6 +243,12 @@ spec:
             # consistent on-disk profile and rely on the watchdog to bring it
             # straight back.
             - { name: RESTART_APP, value: "true" }
+            # svc-xorg sizes the Xvfb framebuffer to MAX_RES (default
+            # 15360x8640x24 = 506 MiB of SysV shm per pod, every pod, always),
+            # even though the visible screen is 1024x768. It is only the RandR
+            # ceiling the viewer can resize up to, so 4K keeps any real monitor
+            # working at ~32 MiB (2026-10-13).
+            - { name: MAX_RES, value: "3840x2160" }
             # CHROME_CLI: extra args appended to the Chromium launch command
             # by the linuxserver init scripts.
             - name: CHROME_CLI
@@ -257,6 +290,7 @@ spec:
             # can still use phone-via-QR passkey when site offers it (platform
             # passkey naturally fails because container has no TouchID/USB).
             - { name: chrome-policy, mountPath: /etc/chromium/policies/managed, readOnly: true }
+            - { name: custom-init,   mountPath: /custom-cont-init.d, readOnly: true }
           readinessProbe:
             tcpSocket: { port: 3000 }
             initialDelaySeconds: 8
@@ -335,6 +369,10 @@ spec:
             name: chrome-vnc-policy
             items:
               - { key: policies.json, path: policies.json }
+        - name: custom-init
+          configMap:
+            name: chrome-vnc-custom-init
+            defaultMode: 0755
         - name: control-code
           configMap:
             name: chrome-vnc-control-code
